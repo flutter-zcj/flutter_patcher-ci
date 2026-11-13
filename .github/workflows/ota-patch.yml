@@ -75,7 +75,7 @@ jobs:
             -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber
           tar -xzf "$RUNNER_TEMP/src/$SRC_ASSET" -C /
           test -f "$PROJECT/pubspec.yaml"
-          test -f /ota-manifest.json && cat /ota-manifest.json || true
+          cat "$PROJECT/.ci-out/ota-manifest.json" || true
 
       - uses: actions/setup-java@v4
         with:
