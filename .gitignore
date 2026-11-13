@@ -43,3 +43,6 @@ migrate_working_dir/
 
 # Python bytecode caches
 __pycache__/
+
+# Local CI output: downloaded APK, patch files, screenshots
+/.ci-out/
