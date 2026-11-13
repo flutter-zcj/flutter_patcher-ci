@@ -21,6 +21,13 @@ dev_dependencies:
     sdk: flutter
   flutter_lints: ^6.0.0
 
+# archive reaches the app through flutter_patcher, so it lives in the host and
+# a patch cannot change it. A newer release on the package host would make
+# `patch` fail with PATCH_PINNED_PACKAGE_CHANGED; this keeps the version the
+# host was built with. Bump it together with the next host build.
+dependency_overrides:
+  archive: 4.6.0
+
 flutter:
   uses-material-design: true
   assets:

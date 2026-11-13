@@ -44,10 +44,11 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
-# Committed on purpose, unlike a library's lock: a patch must compile against
-# the exact dependency versions the host was built with. A runner that
-# re-resolves them drifts (archive 4.6.0 -> 4.7.0, for one) and `patch` then
-# fails with PATCH_PINNED_PACKAGE_CHANGED.
+# Resolved by each developer's own Flutter SDK and package host. Committing it
+# does not help: a lock written against a mirror (pub.flutter-io.cn) is ignored
+# by a runner on pub.dev, which re-resolves and drifts. The versions a patch
+# must match are pinned in pubspec.yaml instead.
+pubspec.lock
 
 # This demo's settings, baselines and updates belong to each developer who
 # runs it. In your own app, commit flutter_patcher.yaml: it holds public keys.
