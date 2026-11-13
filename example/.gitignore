@@ -44,8 +44,10 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
-# Resolved by each developer's own Flutter SDK.
-pubspec.lock
+# Committed on purpose, unlike a library's lock: a patch must compile against
+# the exact dependency versions the host was built with. A runner that
+# re-resolves them drifts (archive 4.6.0 -> 4.7.0, for one) and `patch` then
+# fails with PATCH_PINNED_PACKAGE_CHANGED.
 
 # This demo's settings, baselines and updates belong to each developer who
 # runs it. In your own app, commit flutter_patcher.yaml: it holds public keys.
