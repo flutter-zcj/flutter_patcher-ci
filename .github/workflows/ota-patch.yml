@@ -134,6 +134,13 @@ jobs:
           code=$?
           set -e
           echo "exit=$code stdout=$(wc -c < "$RUNNER_TEMP/build.json") bytes stderr=$(wc -c < "$RUNNER_TEMP/build.err") bytes"
+          if [ -s "$RUNNER_TEMP/build.err" ]; then
+            echo "----- stderr head -----"
+            fold -w 300 "$RUNNER_TEMP/build.err" | head -40
+            echo "----- stderr tail -----"
+            fold -w 300 "$RUNNER_TEMP/build.err" | tail -40
+            echo "----- end stderr -----"
+          fi
           python3 - "$RUNNER_TEMP/build.json" <<'PY'
           import json, sys, textwrap
           raw = open(sys.argv[1]).read()
