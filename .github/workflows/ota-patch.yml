@@ -1,18 +1,23 @@
-name: OTA patch (example)
+name: OTA build (flutter_patcher)
 
 # flutter_patcher refuses to build or patch on an Intel Mac (macos-x64): it
 # publishes patched gen_snapshot binaries for linux-x64, windows-x64 and
-# darwin-arm64 only. ubuntu-latest is a verified linux-x64 host, so this
-# workflow builds the host and makes the patch there instead.
+# darwin-arm64 only. ubuntu-latest is a verified linux-x64 host, so every host
+# build and every patch happens here.
+#
+# The app is NOT checked out from this repo. It usually lives on a LAN GitLab
+# that a GitHub-hosted runner cannot reach, and it depends on local `path:`
+# packages. The caller therefore uploads a source snapshot (a release asset)
+# that already carries the project's absolute paths; this workflow unpacks it
+# back onto those paths, restores the keystore, then builds in place.
 #
 #   mode=host   -> builds the host APK, keeps its baseline in a release
 #   mode=patch  -> restores that baseline from the release, writes the patch
 #
-# The baseline lives in the release tagged `baseline-<versionCode>`: artifacts
-# expire after 90 days, and `patch` needs the baseline for as long as the host
-# is installed. A release keeps it, needs no extra account, and costs no repo
-# space. (flutter_patcher's own baseline_store takes file://, s3:// or a
-# writable https:// store; this is the same durability, synced by CI.)
+# Baselines are namespaced per project: baseline-<profile>-<versionCode>, so
+# several apps can share this repo without overwriting each other's baseline.
+# The snapshot release (src-cache by default) is scratch space: the asset name
+# is reused and clobbered on every build, so it is not a history.
 
 on:
   workflow_dispatch:
@@ -22,21 +27,29 @@ on:
         type: choice
         options: [host, patch]
         default: host
-      message:
-        description: 'mode=patch：可选，留空表示按仓库里提交的代码打补丁'
-        required: false
-        default: ''
-      use_patched_image:
-        description: 'mode=patch：同时用 patch_demo_patched.png 覆盖 patch_demo.png'
-        type: boolean
-        default: false
+      source_tag:
+        description: '源码快照所在的 release 标签'
+        required: true
+        default: src-cache
+      source_asset:
+        description: '源码快照文件名（src-<profile>.tar.gz）'
+        required: true
+      project_path:
+        description: '工程在 runner 上的绝对路径（必须与快照内一致）'
+        required: true
+      profile:
+        description: '基线命名空间，不同工程必须不同'
+        required: true
+      keystore_path:
+        description: 'build.gradle 里 storeFile 的绝对路径'
+        required: true
 
 permissions:
   contents: write
   actions: read
 
 concurrency:
-  group: ota-patch-${{ github.ref }}
+  group: ota-${{ inputs.profile }}-${{ inputs.mode }}
   cancel-in-progress: false
 
 jobs:
@@ -44,7 +57,25 @@ jobs:
     if: inputs.mode == 'host'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Restore the source snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_TAG: ${{ inputs.source_tag }}
+          SRC_ASSET: ${{ inputs.source_asset }}
+          PROJECT: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          # /Users does not exist on a Linux runner. The snapshot restores the
+          # project onto the same absolute paths the dev machine uses, which is
+          # what makes the `path:` dependencies in pubspec.yaml resolve.
+          sudo mkdir -p /Users
+          sudo chown "$(id -u):$(id -g)" /Users
+          mkdir -p "$RUNNER_TEMP/src"
+          gh release download "$SRC_TAG" -R "$GITHUB_REPOSITORY" \
+            -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber
+          tar -xzf "$RUNNER_TEMP/src/$SRC_ASSET" -C /
+          test -f "$PROJECT/pubspec.yaml"
+          test -f /ota-manifest.json && cat /ota-manifest.json || true
 
       - uses: actions/setup-java@v4
         with:
@@ -60,21 +91,25 @@ jobs:
       - name: Restore the release keystore
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE: ${{ inputs.keystore_path }}
         run: |
+          set -euo pipefail
           # build.gradle names the keystore by the absolute path the project
           # uses on the development machine, so put it there.
           if [ -z "$KEYSTORE_B64" ]; then
             echo "::error::Add the repository secret ANDROID_KEYSTORE_B64 (base64 of Key.store)."
             exit 1
           fi
-          sudo mkdir -p /Users/zcj/E
-          sudo chown "$(id -u):$(id -g)" /Users/zcj/E
-          printf '%s' "$KEYSTORE_B64" | base64 -d > /Users/zcj/E/Key.store
-          test -s /Users/zcj/E/Key.store
+          mkdir -p "$(dirname "$KEYSTORE")"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE"
+          test -s "$KEYSTORE"
 
       - name: Build the host
-        working-directory: example
+        env:
+          PROJECT: ${{ inputs.project_path }}
         run: |
+          set -euo pipefail
+          cd "$PROJECT"
           flutter pub get
           # stdout is the JSON report; warnings go to stderr.
           out="$(dart run flutter_patcher build android)"
@@ -84,30 +119,31 @@ jobs:
           import json, sys
           report = json.load(open(sys.argv[1]))
           print('### Host built\n')
-          print(f"- app: `{report['app']}`")
-          print(f"- application_id: `{report['application_id']}`")
-          print(f"- version_code: `{report['version_code']}`")
-          print(f"- fingerprint: `{report['fingerprint']}`")
-          print(f"- signed: `{report['signed']}`")
+          for key in ('app', 'application_id', 'version_code', 'fingerprint', 'signed'):
+              if key in report:
+                  print(f'- {key}: `{report[key]}`')
           PY
 
       - uses: actions/upload-artifact@v4
         with:
           name: host-apk
-          path: example/.dart_tool/flutter_patcher/releases/**/*.apk
+          path: ${{ inputs.project_path }}/.dart_tool/flutter_patcher/releases/**/*.apk
           if-no-files-found: error
 
       - name: Persist the baseline in a release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT: ${{ inputs.project_path }}
+          PROFILE: ${{ inputs.profile }}
         run: |
+          set -euo pipefail
           code=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['version_code'])" "$RUNNER_TEMP/build.json")
-          tag="baseline-$code"
+          tag="baseline-$PROFILE-$code"
           gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create "$tag" -R "$GITHUB_REPOSITORY" \
-              --title "Baseline versionCode $code" \
-              --notes "flutter_patcher host baseline for versionCode $code. Written by ota-patch.yml; every patch of that host needs it, so do not delete."
-          gh release upload "$tag" example/.flutter_patcher/baselines/* \
+              --title "Baseline $PROFILE versionCode $code" \
+              --notes "flutter_patcher host baseline for $PROFILE versionCode $code. Written by ota-patch.yml; every patch of that host needs it, so do not delete."
+          gh release upload "$tag" "$PROJECT"/.flutter_patcher/baselines/* \
             -R "$GITHUB_REPOSITORY" --clobber
           {
             echo ""
@@ -119,7 +155,21 @@ jobs:
     if: inputs.mode == 'patch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Restore the source snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_TAG: ${{ inputs.source_tag }}
+          SRC_ASSET: ${{ inputs.source_asset }}
+          PROJECT: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users
+          sudo chown "$(id -u):$(id -g)" /Users
+          mkdir -p "$RUNNER_TEMP/src"
+          gh release download "$SRC_TAG" -R "$GITHUB_REPOSITORY" \
+            -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber
+          tar -xzf "$RUNNER_TEMP/src/$SRC_ASSET" -C /
+          test -f "$PROJECT/pubspec.yaml"
 
       - uses: actions/setup-java@v4
         with:
@@ -132,56 +182,47 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Restore the release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE: ${{ inputs.keystore_path }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Add the repository secret ANDROID_KEYSTORE_B64 (base64 of Key.store)."
+            exit 1
+          fi
+          mkdir -p "$(dirname "$KEYSTORE")"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE"
+          test -s "$KEYSTORE"
+
       - name: Restore the host baseline
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT: ${{ inputs.project_path }}
+          PROFILE: ${{ inputs.profile }}
         run: |
-          # The host this patch is for: patch resolves the baseline by the
-          # pubspec build number, so download that host's release.
-          code=$(python3 -c "import re,sys;print(re.search(r'^version:\s*[^\s+]+\+(\d+)\s*$', open(sys.argv[1]).read(), re.M).group(1))" example/pubspec.yaml)
-          tag="baseline-$code"
-          mkdir -p example/.flutter_patcher/baselines
+          set -euo pipefail
+          # patch resolves the baseline by the pubspec build number, so fetch
+          # the release that this exact host was built from.
+          code=$(python3 -c "import re,sys;print(re.search(r'^version:\s*[^\s+]+\+(\d+)\s*$', open(sys.argv[1]).read(), re.M).group(1))" "$PROJECT/pubspec.yaml")
+          tag="baseline-$PROFILE-$code"
+          mkdir -p "$PROJECT/.flutter_patcher/baselines"
           if ! gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::no release $tag: build that host first (mode=host)."
             exit 1
           fi
           gh release download "$tag" -R "$GITHUB_REPOSITORY" \
-            -D example/.flutter_patcher/baselines --clobber
-          ls -l example/.flutter_patcher/baselines
-
-      - name: Apply the change
-        working-directory: example
-        env:
-          MESSAGE: ${{ inputs.message }}
-          SWAP_IMAGE: ${{ inputs.use_patched_image }}
-        run: |
-          flutter pub get
-          python3 - <<'PY'
-          import os, pathlib, re, shutil, sys
-
-          # Empty MESSAGE keeps the committed source: the patch then carries
-          # exactly what was pushed.
-          if not os.environ.get('MESSAGE'):
-              print('message unchanged (patch the committed source)')
-          else:
-              main = pathlib.Path('lib/main.dart')
-              text = main.read_text(encoding='utf-8')
-              msg = os.environ['MESSAGE'].replace('\\', '\\\\').replace("'", "\\'")
-              pattern = r"(const message = ')[^']*(';)"
-              new, count = re.subn(pattern, lambda m: m.group(1) + msg + m.group(2), text)
-              if count != 1:
-                  sys.exit(f'expected one `const message` line, found {count}')
-              main.write_text(new, encoding='utf-8')
-              print(f'message -> {os.environ["MESSAGE"]}')
-
-          if os.environ.get('SWAP_IMAGE') == 'true':
-              shutil.copyfile('assets/patch_demo_patched.png', 'assets/patch_demo.png')
-              print('assets/patch_demo.png replaced')
-          PY
+            -D "$PROJECT/.flutter_patcher/baselines" --clobber
+          ls -l "$PROJECT/.flutter_patcher/baselines"
 
       - name: Make the patch
-        working-directory: example
+        env:
+          PROJECT: ${{ inputs.project_path }}
         run: |
+          set -euo pipefail
+          cd "$PROJECT"
+          flutter pub get
           out="$(dart run flutter_patcher patch android)"
           echo "$out"
           echo "$out" > "$RUNNER_TEMP/patch.json"
@@ -191,11 +232,11 @@ jobs:
           print('### Patch created\n')
           for key in ('status', 'file', 'fingerprint', 'version'):
               if key in report:
-                  print(f"- {key}: `{report[key]}`")
+                  print(f'- {key}: `{report[key]}`')
           PY
 
       - uses: actions/upload-artifact@v4
         with:
           name: patch-file
-          path: example/.dart_tool/flutter_patcher/patches/**/*.fptc
+          path: ${{ inputs.project_path }}/.dart_tool/flutter_patcher/patches/**/*.fptc
           if-no-files-found: error
