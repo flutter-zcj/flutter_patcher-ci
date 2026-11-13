@@ -1,0 +1,42 @@
+# Build outputs and binary artifacts (huge, must not enter the published tarball).
+# Anchored: an unanchored build/ also drops lib/src/cli/build/.
+/build/
+.dart_tool/
+doc/api/
+pubspec.lock
+android/.cxx/
+android/build/
+example/build/
+example/.dart_tool/
+example/.flutter-plugins
+example/.flutter-plugins-dependencies
+example/ios/
+example/macos/
+example/windows/
+example/linux/
+example/web/
+example/android/.gradle/
+example/android/build/
+example/android/app/build/
+example/android/local.properties
+
+# Pre-built demo APKs / .so artifacts under repo root
+/dist/
+
+# IDE and editor metadata
+.idea/
+.vscode/
+*.iml
+
+# Workspace scratch space (per global rules)
+/plan/
+/temp/
+
+# Tests stay in Git; none of them is ever built into an app.
+/test/
+android/src/test/
+android/src/androidTest/
+
+# OS junk
+.DS_Store
+Thumbs.db

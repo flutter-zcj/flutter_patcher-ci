@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "channel": "flutter_patcher",
+  "events": "flutter_patcher/events",
+  "methods": {
+    "bootPayload": {"args": {"fingerprint": "String", "publicKeyBase64": "String"}, "returns": "Map? {transportVersion: int, attempt: String, and envelopeBytes: Uint8List (bytecode) | kind: libapp, assets: Map<String, Uint8List>, fonts: Map<String, List<Uint8List>> (so)}"},
+    "backgroundPayload": {"args": {"fingerprint": "String", "publicKeyBase64": "String"}, "returns": "Map? {transportVersion: int, and the bootPayload fields of its kind; no attempt}"},
+    "markBooting": {"args": {"attempt": "String?"}, "returns": "null"},
+    "reportBootSuccess": {"args": {"attempt": "String?"}, "returns": "null"},
+    "reportDartBootError": {"args": {"attempt": "String?", "message": "String", "quarantine": "bool?"}, "returns": "null"},
+    "saveConfig": {"args": {"maxCrashCount": "int", "loaderFieldCandidates": "List<String>", "loaderFallbackHeuristic": "bool"}, "returns": "null"},
+    "hostStrategy": {"args": {}, "returns": "String? (so | bytecode)"},
+    "hostUrl": {"args": {}, "returns": "String? (the url build wrote into the host)"},
+    "patchTarget": {"args": {}, "returns": "Map? {scope: Map<String, String> {application_id, channel, flavor, version_code, abi, fingerprint, strategy}, signed: bool, acceptedSeq: int}"},
+    "inspectPatch": {"args": {"header": "Uint8List (the first 146 bytes of a patch file)"}, "returns": "Map {fresh: bool, action: String? (publish | withdraw), seq: int?, reason: String?}"},
+    "applyPatchFile": {"args": {"path": "String (a patch file; left in place)"}, "returns": "Map {ok: bool, error: String?, message: String?, action: String? (publish | withdraw)}"},
+    "rollback": {"args": {}, "returns": "null"},
+    "currentVersion": {"args": {}, "returns": "String?"},
+    "lastBootDiagnostic": {"args": {}, "returns": "Map?"},
+    "appVersionCode": {"args": {}, "returns": "int (-1 on failure)"},
+    "deviceAbi": {"args": {}, "returns": "String (arm64-v8a | ios-arm64)"},
+    "blacklist": {"args": {}, "returns": "List<Map>"},
+    "clearBlacklist": {"args": {}, "returns": "null"}
+  },
+  "channel_errors": ["BYTECODE_REJECTED", "PATCH_REJECTED", "ROLLBACK_FAILED"],
+  "apply_errors": ["INVALID_ARGS", "BLACKLISTED", "NETWORK", "SIGNATURE_INVALID", "IO_ERROR", "UNKNOWN"],
+  "boot_statuses": ["NO_PATCH", "PATCHED", "DROPPED_VERSION_CODE_MISMATCH", "DROPPED_CIRCUIT_BREAKER", "HOOK_INSTALL_FAILED", "BYTECODE_BOOT_FAILED", "SO_BOOT_FAILED", "UNKNOWN"],
+  "progress_phases": ["downloading", "verifying", "finalizing"]
+}

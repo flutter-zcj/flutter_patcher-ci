@@ -1,0 +1,65 @@
+name: CI
+on:
+  push:
+    branches: [dev]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.versions.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: xuelinger2333/flutter_patcher_artifacts
+          ref: ${{ vars.ARTIFACTS_COMMIT }}
+          persist-credentials: false
+      - id: versions
+        env:
+          ARTIFACTS_COMMIT: ${{ vars.ARTIFACTS_COMMIT }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          pin = os.environ['ARTIFACTS_COMMIT']
+          assert re.fullmatch('[0-9a-f]{40}', pin), 'Set ARTIFACTS_COMMIT to the reviewed source commit'
+          assert subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip() == pin
+          versions = [v.strip() for v in Path('supported_versions.txt').read_text().splitlines() if v.strip() and not v.startswith('#')]
+          assert versions and len(versions) == len(set(versions))
+          assert all(re.fullmatch(r'\d+\.\d+\.\d+', v) for v in versions)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('matrix=' + json.dumps({'version': versions}) + '\n')
+          PY
+  fast:
+    needs: versions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.versions.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          flutter-version: ${{ matrix.version }}
+          channel: stable
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+      - name: CLI publication to an isolated S3
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ci-tests"
+          "$RUNNER_TEMP/ci-tests/bin/pip" install -r test/acceptance/test-requirements.txt
+          export PATH="$RUNNER_TEMP/ci-tests/bin:$PATH"
+          python3 test/acceptance/linux_tests.py --repo "$PWD" --dart "$(command -v dart)" --out "$PWD/.dart_tool/flutter_patcher/ci-fast"
+      - name: Native JVM regression
+        # Robolectric 4.14 cannot read the classes of Java 25, the runner's default JDK.
+        run: JAVA_HOME="$JAVA_HOME_21_X64" python3 test/acceptance/native_tests.py --repo "$PWD" --flutter "$(command -v flutter)" --out "$PWD/.dart_tool/flutter_patcher/ci-native"
+      - run: echo 'Fast tests only; run test/acceptance/device_acceptance.py for device acceptance.' >> "$GITHUB_STEP_SUMMARY"

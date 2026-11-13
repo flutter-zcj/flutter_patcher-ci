@@ -1,0 +1,169 @@
+name: OTA patch (example)
+
+# flutter_patcher refuses to build or patch on an Intel Mac (macos-x64): it
+# publishes patched gen_snapshot binaries for linux-x64, windows-x64 and
+# darwin-arm64 only. ubuntu-latest is a verified linux-x64 host, so this
+# workflow builds the host and makes the patch there instead.
+#
+#   mode=host   -> builds the host APK, keeps its baseline as an artifact
+#   mode=patch  -> restores that baseline, changes the text, writes the patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'host = 构建宿主 APK；patch = 基于该宿主产出补丁'
+        type: choice
+        options: [host, patch]
+        default: host
+      build_run_id:
+        description: 'mode=patch 必填：构建宿主那一次的 run id'
+        required: false
+      message:
+        description: 'mode=patch：写入 example/lib/main.dart 的新文案'
+        required: false
+        default: '这条文字来自补丁'
+      use_patched_image:
+        description: 'mode=patch：同时用 patch_demo_patched.png 覆盖 patch_demo.png'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ota-patch-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  host:
+    if: inputs.mode == 'host'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Build the host
+        working-directory: example
+        run: |
+          flutter pub get
+          # stdout is the JSON report; warnings go to stderr.
+          out="$(dart run flutter_patcher build android)"
+          echo "$out"
+          echo "$out" > "$RUNNER_TEMP/build.json"
+          python3 - "$RUNNER_TEMP/build.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          print('### Host built\n')
+          print(f"- app: `{report['app']}`")
+          print(f"- application_id: `{report['application_id']}`")
+          print(f"- version_code: `{report['version_code']}`")
+          print(f"- fingerprint: `{report['fingerprint']}`")
+          print(f"- signed: `{report['signed']}`")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-apk
+          path: example/.dart_tool/flutter_patcher/releases/**/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-baseline
+          path: example/.flutter_patcher/baselines
+          if-no-files-found: error
+
+      - name: Next step
+        run: |
+          {
+            echo ""
+            echo "下载 host-apk 里的 APK 并安装：\`adb install -r <app-release.apk>\`"
+            echo ""
+            echo "然后以 mode=patch、build_run_id=${{ github.run_id }} 再跑一次本 workflow。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  patch:
+    if: inputs.mode == 'patch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Restore the host baseline
+        uses: actions/download-artifact@v4
+        with:
+          name: host-baseline
+          path: example/.flutter_patcher/baselines
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show the restored baseline
+        run: ls -l example/.flutter_patcher/baselines
+
+      - name: Apply the change
+        working-directory: example
+        env:
+          MESSAGE: ${{ inputs.message }}
+          SWAP_IMAGE: ${{ inputs.use_patched_image }}
+        run: |
+          flutter pub get
+          python3 - <<'PY'
+          import os, pathlib, re, shutil, sys
+
+          main = pathlib.Path('lib/main.dart')
+          text = main.read_text(encoding='utf-8')
+          msg = os.environ['MESSAGE'].replace('\\', '\\\\').replace("'", "\\'")
+          pattern = r"(const message = ')[^']*(';)"
+          new, count = re.subn(pattern, lambda m: m.group(1) + msg + m.group(2), text)
+          if count != 1:
+              sys.exit(f'expected one `const message` line, found {count}')
+          main.write_text(new, encoding='utf-8')
+          print(f'message -> {os.environ["MESSAGE"]}')
+
+          if os.environ.get('SWAP_IMAGE') == 'true':
+              shutil.copyfile('assets/patch_demo_patched.png', 'assets/patch_demo.png')
+              print('assets/patch_demo.png replaced')
+          PY
+
+      - name: Make the patch
+        working-directory: example
+        run: |
+          out="$(dart run flutter_patcher patch android)"
+          echo "$out"
+          echo "$out" > "$RUNNER_TEMP/patch.json"
+          python3 - "$RUNNER_TEMP/patch.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          print('### Patch created\n')
+          for key in ('status', 'file', 'fingerprint', 'version'):
+              if key in report:
+                  print(f"- {key}: `{report[key]}`")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patch-file
+          path: example/.dart_tool/flutter_patcher/patches/**/*.fptc
+          if-no-files-found: error
