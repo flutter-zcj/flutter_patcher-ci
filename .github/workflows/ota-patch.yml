@@ -128,9 +128,27 @@ jobs:
           extra=""
           if [ -n "$APPLICATION_ID" ]; then extra="--application-id $APPLICATION_ID"; fi
           # stdout is the JSON report; warnings go to stderr.
-          out="$(dart run flutter_patcher build android $extra)"
-          echo "$out"
-          echo "$out" > "$RUNNER_TEMP/build.json"
+          set +e
+          dart run flutter_patcher build android $extra \
+            > "$RUNNER_TEMP/build.json" 2> "$RUNNER_TEMP/build.err"
+          code=$?
+          set -e
+          echo "exit=$code stdout=$(wc -c < "$RUNNER_TEMP/build.json") bytes stderr=$(wc -c < "$RUNNER_TEMP/build.err") bytes"
+          python3 - "$RUNNER_TEMP/build.json" <<'PY'
+          import json, sys, textwrap
+          raw = open(sys.argv[1]).read()
+          try:
+              report = json.loads(raw)
+          except Exception as error:
+              print('unparsable report:', error)
+              print(raw[:4000])
+              sys.exit(0)
+          print('status:', report.get('status'), report.get('code'))
+          for line in str(report.get('message', '')).split(' | '):
+              for chunk in textwrap.wrap(line, 300) or ['']:
+                  print('  ', chunk)
+          PY
+          [ "$code" -eq 0 ] || exit "$code"
           python3 - "$RUNNER_TEMP/build.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json, sys
           report = json.load(open(sys.argv[1]))
