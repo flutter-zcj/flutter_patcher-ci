@@ -54,6 +54,21 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Restore the release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          # build.gradle names the keystore by the absolute path the project
+          # uses on the development machine, so put it there.
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Add the repository secret ANDROID_KEYSTORE_B64 (base64 of Key.store)."
+            exit 1
+          fi
+          sudo mkdir -p /Users/zcj/E
+          sudo chown "$(id -u):$(id -g)" /Users/zcj/E
+          printf '%s' "$KEYSTORE_B64" | base64 -d > /Users/zcj/E/Key.store
+          test -s /Users/zcj/E/Key.store
+
       - name: Build the host
         working-directory: example
         run: |
