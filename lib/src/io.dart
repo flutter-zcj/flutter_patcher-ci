@@ -15,42 +15,19 @@ class PayloadDownloadException implements Exception {
   String toString() => 'Patch download failed';
 }
 
-/// Plain HTTP to a LAN address, for development only: build with
-/// `--dart-define=FLUTTER_PATCHER_INSECURE_HTTP=true`. A patch is executable
-/// code, so on a network others can join, plain HTTP lets them choose what
-/// the app runs. A release build leaves this off.
-const allowInsecureHttp = bool.fromEnvironment(
-  'FLUTTER_PATCHER_INSECURE_HTTP',
-);
-
-/// The RFC 1918 addresses a development machine and a phone share on a LAN.
-bool isPrivateHost(String host) {
-  final parts = host.split('.');
-  if (parts.length != 4) return false;
-  final octets = <int>[];
-  for (final part in parts) {
-    final value = int.tryParse(part);
-    if (value == null || value < 0 || value > 255) return false;
-    octets.add(value);
-  }
-  return octets[0] == 10 ||
-      (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
-      (octets[0] == 192 && octets[1] == 168);
-}
-
 /// HTTPS, or HTTP to this device itself, where `flutter_patcher serve` is
-/// reached through adb reverse. A build that opted in with
-/// [allowInsecureHttp] also takes HTTP to a LAN address. Redirects and
-/// ambient credentials are deliberately unsupported so a response cannot
-/// send a download elsewhere.
+/// reached through adb reverse. Redirects and ambient credentials are
+/// deliberately unsupported so a response cannot send a download elsewhere.
+///
+/// An app that needs another policy, such as plain HTTP to a LAN address
+/// while developing, downloads the file itself and passes it to
+/// `FlutterPatcher.applyPatchBytes`; see the example.
 Uri updateUri(String url) {
   final uri = Uri.parse(url);
   final local =
       uri.scheme == 'http' &&
       const {'127.0.0.1', '::1', 'localhost'}.contains(uri.host);
-  final lan =
-      allowInsecureHttp && uri.scheme == 'http' && isPrivateHost(uri.host);
-  if (!(uri.scheme == 'https' || local || lan) ||
+  if (!(uri.scheme == 'https' || local) ||
       uri.host.isEmpty ||
       uri.userInfo.isNotEmpty ||
       uri.hasFragment) {

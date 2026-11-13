@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_patcher/flutter_patcher.dart';
 
@@ -46,7 +48,9 @@ class Demo extends StatefulWidget {
 }
 
 class _DemoState extends State<Demo> {
-  // 在本机运行 `flutter_patcher serve`，再通过 adb reverse 走 USB 访问。
+  // 本机跑 `flutter_patcher serve`（或任何静态服务）后填它的地址：留空是
+  // http://127.0.0.1:8686；走 USB 时先 `adb reverse tcp:8686 tcp:8686`，
+  // 走局域网时填 http://<本机IP>:<端口>/<目录>。
   final _url = TextEditingController();
   final _log = <String>[];
   var _busy = false;
@@ -68,25 +72,72 @@ class _DemoState extends State<Demo> {
     }
   }
 
+  /// 自己下载补丁文件，再交给库校验安装。
+  ///
+  /// `checkUpdate` 只接受 https 或回环地址，因为补丁是可执行代码。这里把
+  /// “从哪儿下载、用什么协议”留在本项目里：用 [FlutterPatcher.patchTarget]
+  /// 拿到本宿主的文件名，自己取前 146 字节判断是否新鲜，再整包下载交给
+  /// [FlutterPatcher.applyPatchBytes]。指纹、SHA-256、签名与安装仍全部由库校验。
   Future<void> _update() => _run(() async {
-    final url = _url.text.trim();
-    final check = await FlutterPatcher.checkUpdate(
-      url: url.isEmpty ? null : url,
+    final base = _url.text.trim().isEmpty
+        ? 'http://127.0.0.1:8686'
+        : _url.text.trim();
+    final target = await FlutterPatcher.patchTarget;
+    final file = Uri.parse(
+      '${base.replaceFirst(RegExp(r'/+$'), '')}/${target.fileName}',
     );
-    if (!check.hasUpdate) return _note('已是最新版本');
-    PatchApplyPhase? phase;
-    final result = await FlutterPatcher.applyPatch(
-      check.patch!,
-      onProgress: (p) {
-        if (p.phase != phase) _note('${(phase = p.phase).name}…');
-      },
-    );
+    _note('GET $file');
+
+    final header = await _fetch(file, limit: 146);
+    if (header == null) return _note('服务器上没有这个宿主的补丁');
+    final inspection = await FlutterPatcher.inspectPatch(header);
+    if (!inspection.fresh) {
+      final why = inspection.reason ?? 'seq ${inspection.seq}';
+      return _note('已是最新版本（$why）');
+    }
+
+    _note('downloading…');
+    final bytes = await _fetch(file);
+    if (bytes == null) return _note('下载失败：文件不见了');
+    _note('verifying…');
+    final result = await FlutterPatcher.applyPatchBytes(bytes);
     _note(
       result.ok
-          ? '安装完成：重启应用即可运行补丁 ${check.patch!.version}'
+          ? '安装完成：重启应用即可运行补丁 ${inspection.seq}'
           : '安装失败：${result.error?.name} ${result.message ?? ''}',
     );
   });
+
+  /// [uri] 的内容，或 null（404）；[limit] 表示只要前几个字节。
+  ///
+  /// 不限制 scheme：下载策略属于本项目，库的默认策略只用于它自己的下载器。
+  Future<List<int>?> _fetch(Uri uri, {int? limit}) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15);
+    try {
+      final request = await client.getUrl(uri);
+      request.followRedirects = false;
+      if (limit != null) {
+        request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-${limit - 1}');
+      }
+      final response = await request.close();
+      if (response.statusCode == HttpStatus.notFound) return null;
+      if (response.statusCode != HttpStatus.ok &&
+          response.statusCode != HttpStatus.partialContent) {
+        throw PatcherException('HTTP ${response.statusCode}');
+      }
+      final bytes = <int>[];
+      await for (final chunk in response) {
+        bytes.addAll(chunk);
+        if (limit != null && bytes.length >= limit) break;
+      }
+      return limit == null || bytes.length <= limit
+          ? bytes
+          : bytes.sublist(0, limit);
+    } finally {
+      client.close(force: true);
+    }
+  }
 
   Future<void> _rollback() => _run(() async {
     await FlutterPatcher.rollback();
@@ -140,7 +191,7 @@ class _DemoState extends State<Demo> {
                     keyboardType: TextInputType.url,
                     decoration: const InputDecoration(
                       labelText: '更新地址',
-                      helperText: '留空则使用构建此应用时的地址',
+                      helperText: '留空则用 http://127.0.0.1:8686',
                     ),
                   ),
                   const SizedBox(height: 16),
