@@ -116,6 +116,12 @@ jobs:
           set -euo pipefail
           cd "$PROJECT"
           flutter pub get
+          # TEMP DIAGNOSTIC: flutter_patcher keeps only the last two lines of a
+          # failed step, which hides frontend_server's error text. Widen it.
+          f=$(ls -d "$PUB_CACHE"/hosted/pub.dev/flutter_patcher-*/lib/src/cli/core.dart 2>/dev/null | head -1)
+          echo "diagnostic patch: $f"
+          if [ -n "$f" ]; then sed -i 's/lines.length > 2 ? lines.length - 2 : 0/0/' "$f"; fi
+          grep -n "lines.skip" "$f" || true
           # flutter_patcher reads build.gradle without stripping comments, so a
           # commented-out old applicationId looks like a second app; the caller
           # resolved the live one and passes it explicitly.
