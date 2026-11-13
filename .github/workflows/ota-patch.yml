@@ -169,6 +169,23 @@ jobs:
                   print(f'- {key}: `{report[key]}`')
           PY
 
+      - name: Diagnose a failed build
+        if: failure()
+        run: |
+          set +e
+          echo "----- work dirs -----"
+          ls -d ~/.flutter_patcher/builds/*/ 2>/dev/null | tail -3
+          work=$(ls -d ~/.flutter_patcher/builds/*/ 2>/dev/null | tail -1)
+          [ -z "$work" ] && exit 0
+          echo "----- files in $work -----"
+          ls "$work" | head -30
+          echo "----- interface entries mentioning the class -----"
+          for f in "$work"*.yaml "$work"*.json; do
+            [ -f "$f" ] || continue
+            hit=$(grep -n -A6 "CupertinoDesktopTextSelectionToolbarButton" "$f" 2>/dev/null | head -30)
+            [ -n "$hit" ] && { echo "== $f"; echo "$hit"; }
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: host-apk
