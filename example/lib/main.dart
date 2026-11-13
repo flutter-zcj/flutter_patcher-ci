@@ -64,6 +64,10 @@ class _DemoState extends State<Demo> {
       await action();
     } on PatcherException catch (e) {
       _note(e.message);
+    } catch (e) {
+      // 启动后 5 秒内未捕获的异常会被 patch 的崩溃保护当成启动失败，
+      // 把补丁回滚掉（maxCrashCount 默认 1），所以这里必须兜住一切。
+      _note('出错：$e');
     } finally {
       setState(() {
         _busy = false;
@@ -134,6 +138,11 @@ class _DemoState extends State<Demo> {
       return limit == null || bytes.length <= limit
           ? bytes
           : bytes.sublist(0, limit);
+    } on PatcherException {
+      rethrow;
+    } catch (e) {
+      // 网络异常统一转成 PatcherException，交给界面显示，不要逃逸。
+      throw PatcherException('下载失败：$e');
     } finally {
       client.close(force: true);
     }
