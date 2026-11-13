@@ -43,6 +43,10 @@ on:
       keystore_path:
         description: 'build.gradle 里 storeFile 的绝对路径'
         required: true
+      application_id:
+        description: '应用的 applicationId（build.gradle 有注释掉的旧 id 时必须显式给）'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -107,12 +111,18 @@ jobs:
       - name: Build the host
         env:
           PROJECT: ${{ inputs.project_path }}
+          APPLICATION_ID: ${{ inputs.application_id }}
         run: |
           set -euo pipefail
           cd "$PROJECT"
           flutter pub get
+          # flutter_patcher reads build.gradle without stripping comments, so a
+          # commented-out old applicationId looks like a second app; the caller
+          # resolved the live one and passes it explicitly.
+          extra=""
+          if [ -n "$APPLICATION_ID" ]; then extra="--application-id $APPLICATION_ID"; fi
           # stdout is the JSON report; warnings go to stderr.
-          out="$(dart run flutter_patcher build android)"
+          out="$(dart run flutter_patcher build android $extra)"
           echo "$out"
           echo "$out" > "$RUNNER_TEMP/build.json"
           python3 - "$RUNNER_TEMP/build.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
