@@ -2,7 +2,7 @@ name: flutter_patcher_example
 description: "Demonstrates flutter_patcher: build a host, patch it and serve the patch."
 publish_to: 'none'
 # The build number is the host's versionCode; each host needs a new one.
-version: 1.0.0+1
+version: 1.0.1+2
 
 environment:
   # The floor of flutter_patcher itself: older SDKs stop at pub get.

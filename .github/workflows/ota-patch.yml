@@ -27,6 +27,10 @@ on:
         description: 'mode=patch：同时用 patch_demo_patched.png 覆盖 patch_demo.png'
         type: boolean
         default: false
+      insecure_http:
+        description: '允许明文 HTTP 访问局域网地址（仅调试；改了必须重建宿主）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -58,8 +62,13 @@ jobs:
         working-directory: example
         run: |
           flutter pub get
+          # A patch and its host must be built with the same defines.
+          extra=""
+          if [ "${{ inputs.insecure_http }}" = "true" ]; then
+            extra="--dart-define=FLUTTER_PATCHER_INSECURE_HTTP=true"
+          fi
           # stdout is the JSON report; warnings go to stderr.
-          out="$(dart run flutter_patcher build android)"
+          out="$(dart run flutter_patcher build android $extra)"
           echo "$out"
           echo "$out" > "$RUNNER_TEMP/build.json"
           python3 - "$RUNNER_TEMP/build.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
@@ -150,7 +159,12 @@ jobs:
       - name: Make the patch
         working-directory: example
         run: |
-          out="$(dart run flutter_patcher patch android)"
+          # Same defines as the host it patches.
+          extra=""
+          if [ "${{ inputs.insecure_http }}" = "true" ]; then
+            extra="--dart-define=FLUTTER_PATCHER_INSECURE_HTTP=true"
+          fi
+          out="$(dart run flutter_patcher patch android $extra)"
           echo "$out"
           echo "$out" > "$RUNNER_TEMP/patch.json"
           python3 - "$RUNNER_TEMP/patch.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
