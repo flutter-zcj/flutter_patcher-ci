@@ -5,8 +5,14 @@ name: OTA patch (example)
 # darwin-arm64 only. ubuntu-latest is a verified linux-x64 host, so this
 # workflow builds the host and makes the patch there instead.
 #
-#   mode=host   -> builds the host APK, keeps its baseline as an artifact
-#   mode=patch  -> restores that baseline, changes the text, writes the patch
+#   mode=host   -> builds the host APK, keeps its baseline in a release
+#   mode=patch  -> restores that baseline from the release, writes the patch
+#
+# The baseline lives in the release tagged `baseline-<versionCode>`: artifacts
+# expire after 90 days, and `patch` needs the baseline for as long as the host
+# is installed. A release keeps it, needs no extra account, and costs no repo
+# space. (flutter_patcher's own baseline_store takes file://, s3:// or a
+# writable https:// store; this is the same durability, synced by CI.)
 
 on:
   workflow_dispatch:
@@ -16,9 +22,6 @@ on:
         type: choice
         options: [host, patch]
         default: host
-      build_run_id:
-        description: 'mode=patch 必填：构建宿主那一次的 run id'
-        required: false
       message:
         description: 'mode=patch：可选，留空表示按仓库里提交的代码打补丁'
         required: false
@@ -29,7 +32,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 concurrency:
@@ -94,19 +97,22 @@ jobs:
           path: example/.dart_tool/flutter_patcher/releases/**/*.apk
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: host-baseline
-          path: example/.flutter_patcher/baselines
-          if-no-files-found: error
-
-      - name: Next step
+      - name: Persist the baseline in a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          code=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['version_code'])" "$RUNNER_TEMP/build.json")
+          tag="baseline-$code"
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+              --title "Baseline versionCode $code" \
+              --notes "flutter_patcher host baseline for versionCode $code. Written by ota-patch.yml; every patch of that host needs it, so do not delete."
+          gh release upload "$tag" example/.flutter_patcher/baselines/* \
+            -R "$GITHUB_REPOSITORY" --clobber
           {
             echo ""
+            echo "基线已存到 release \`$tag\`（不会随 artifact 过期）。"
             echo "下载 host-apk 里的 APK 并安装：\`adb install -r <app-release.apk>\`"
-            echo ""
-            echo "然后以 mode=patch、build_run_id=${{ github.run_id }} 再跑一次本 workflow。"
           } >> "$GITHUB_STEP_SUMMARY"
 
   patch:
@@ -127,15 +133,21 @@ jobs:
           cache: true
 
       - name: Restore the host baseline
-        uses: actions/download-artifact@v4
-        with:
-          name: host-baseline
-          path: example/.flutter_patcher/baselines
-          run-id: ${{ inputs.build_run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Show the restored baseline
-        run: ls -l example/.flutter_patcher/baselines
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The host this patch is for: patch resolves the baseline by the
+          # pubspec build number, so download that host's release.
+          code=$(python3 -c "import re,sys;print(re.search(r'^version:\s*[^\s+]+\+(\d+)\s*$', open(sys.argv[1]).read(), re.M).group(1))" example/pubspec.yaml)
+          tag="baseline-$code"
+          mkdir -p example/.flutter_patcher/baselines
+          if ! gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::no release $tag: build that host first (mode=host)."
+            exit 1
+          fi
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" \
+            -D example/.flutter_patcher/baselines --clobber
+          ls -l example/.flutter_patcher/baselines
 
       - name: Apply the change
         working-directory: example
