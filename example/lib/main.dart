@@ -7,7 +7,7 @@ import 'status_card.dart';
 
 /// 修改这段文字，或替换 assets/patch_demo.png，然后运行
 /// `dart run flutter_patcher patch android`：更新后冷启动即可看到变化。
-const message = '这条文字来自已安装的应用';
+const message = '这条文字来自补丁 · 技能验证';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();

@@ -20,9 +20,9 @@ on:
         description: 'mode=patch 必填：构建宿主那一次的 run id'
         required: false
       message:
-        description: 'mode=patch：写入 example/lib/main.dart 的新文案'
+        description: 'mode=patch：可选，留空表示按仓库里提交的代码打补丁'
         required: false
-        default: '这条文字来自补丁'
+        default: ''
       use_patched_image:
         description: 'mode=patch：同时用 patch_demo_patched.png 覆盖 patch_demo.png'
         type: boolean
@@ -147,15 +147,20 @@ jobs:
           python3 - <<'PY'
           import os, pathlib, re, shutil, sys
 
-          main = pathlib.Path('lib/main.dart')
-          text = main.read_text(encoding='utf-8')
-          msg = os.environ['MESSAGE'].replace('\\', '\\\\').replace("'", "\\'")
-          pattern = r"(const message = ')[^']*(';)"
-          new, count = re.subn(pattern, lambda m: m.group(1) + msg + m.group(2), text)
-          if count != 1:
-              sys.exit(f'expected one `const message` line, found {count}')
-          main.write_text(new, encoding='utf-8')
-          print(f'message -> {os.environ["MESSAGE"]}')
+          # Empty MESSAGE keeps the committed source: the patch then carries
+          # exactly what was pushed.
+          if not os.environ.get('MESSAGE'):
+              print('message unchanged (patch the committed source)')
+          else:
+              main = pathlib.Path('lib/main.dart')
+              text = main.read_text(encoding='utf-8')
+              msg = os.environ['MESSAGE'].replace('\\', '\\\\').replace("'", "\\'")
+              pattern = r"(const message = ')[^']*(';)"
+              new, count = re.subn(pattern, lambda m: m.group(1) + msg + m.group(2), text)
+              if count != 1:
+                  sys.exit(f'expected one `const message` line, found {count}')
+              main.write_text(new, encoding='utf-8')
+              print(f'message -> {os.environ["MESSAGE"]}')
 
           if os.environ.get('SWAP_IMAGE') == 'true':
               shutil.copyfile('assets/patch_demo_patched.png', 'assets/patch_demo.png')
