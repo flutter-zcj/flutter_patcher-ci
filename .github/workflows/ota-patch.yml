@@ -55,6 +55,10 @@ on:
         description: '宿主策略：留空=bytecode（默认）；so=整包 so，不建 kernel/interface'
         required: false
         default: ''
+      build_args:
+        description: '透传给 flutter build 的额外选项（在 -- 之后），如 --no-tree-shake-icons'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -136,6 +140,7 @@ jobs:
           PROJECT: ${{ inputs.project_path }}
           APPLICATION_ID: ${{ inputs.application_id }}
           STRATEGY: ${{ inputs.strategy }}
+          BUILD_ARGS: ${{ inputs.build_args }}
         run: |
           set -euo pipefail
           cd "$PROJECT"
@@ -152,6 +157,7 @@ jobs:
           extra=""
           if [ -n "$APPLICATION_ID" ]; then extra="--application-id $APPLICATION_ID"; fi
           if [ -n "$STRATEGY" ]; then extra="$extra --strategy $STRATEGY"; fi
+          if [ -n "$BUILD_ARGS" ]; then extra="$extra -- $BUILD_ARGS"; fi
           # stdout is the JSON report; warnings go to stderr.
           #
           # 2021-era plugins break modern Gradle/AGP (jcenter(), manifest
