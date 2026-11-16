@@ -353,10 +353,19 @@ jobs:
       - name: Make the patch
         env:
           PROJECT: ${{ inputs.project_path }}
+          # The patch also runs a full Gradle assembleRelease (twice: once for
+          # the baseline APK, once for the patched one). The default 2g heap
+          # dies at JetifyTransform on a big app, exactly like the host build.
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx4096m -Dorg.gradle.workers.max=2
         run: |
           set -euo pipefail
           cd "$PROJECT"
           flutter pub get
+          # Widen flutter_patcher's failure report (same diagnostic as host).
+          f=$(ls -d "$PUB_CACHE"/hosted/pub.dev/flutter_patcher-*/lib/src/cli/core.dart 2>/dev/null | head -1 || true)
+          if [ -n "$f" ]; then
+            sed -i 's/lines.length > 2 ? lines.length - 2 : 0/0/' "$f"
+          fi
           # Same old-plugin repairs as the host build; see the script.
           source "$GITHUB_WORKSPACE/.github/scripts/modernize-plugins.sh"
           modernize_plugins
@@ -382,7 +391,19 @@ jobs:
               continue
             fi
             echo "patch failed (exit $code)"
-            fold -w 300 "$RUNNER_TEMP/patch.err" | tail -40
+            fold -w 300 "$RUNNER_TEMP/patch.err" | tail -80
+            # Gradle's real error is inside patcher's work dir, not in the
+            # two-line JSON report. Dump it before giving up.
+            work=$(ls -dt "$HOME"/.flutter_patcher/patches/run.pending-* 2>/dev/null | head -1 || true)
+            if [ -n "$work" ]; then
+              echo "----- patch work dir: $work -----"
+              find "$work" -maxdepth 2 -type f \( -name '*.log' -o -name '*.txt' -o -name '*.json' \) -print 2>/dev/null | head -30
+              for log in "$work"/*.log "$work"/*.txt "$work"/build.err; do
+                [ -f "$log" ] || continue
+                echo "===== $log ====="
+                grep -iE "FAILURE:|What went wrong|Execution failed|error:|Exception|heap space|Could not|BUILD FAILED|Caused by" "$log" 2>/dev/null | head -40
+              done
+            fi
             exit "$code"
           done
           cat "$RUNNER_TEMP/patch.json"
