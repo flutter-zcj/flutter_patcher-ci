@@ -51,6 +51,10 @@ on:
         description: '构建用的 Flutter 版本；flutter_patcher 的工具按版本下载'
         required: false
         default: '3.47.9'
+      strategy:
+        description: '宿主策略：留空=bytecode（默认）；so=整包 so，不建 kernel/interface'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -116,6 +120,7 @@ jobs:
         env:
           PROJECT: ${{ inputs.project_path }}
           APPLICATION_ID: ${{ inputs.application_id }}
+          STRATEGY: ${{ inputs.strategy }}
         run: |
           set -euo pipefail
           cd "$PROJECT"
@@ -131,6 +136,7 @@ jobs:
           # resolved the live one and passes it explicitly.
           extra=""
           if [ -n "$APPLICATION_ID" ]; then extra="--application-id $APPLICATION_ID"; fi
+          if [ -n "$STRATEGY" ]; then extra="$extra --strategy $STRATEGY"; fi
           # stdout is the JSON report; warnings go to stderr.
           set +e
           dart run flutter_patcher build android $extra \
