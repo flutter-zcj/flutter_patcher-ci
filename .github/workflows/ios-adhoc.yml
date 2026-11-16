@@ -87,6 +87,21 @@ jobs:
           rm -f .flutter-plugins .flutter-plugins-dependencies
           flutter pub get
           grep FLUTTER_ROOT ios/Flutter/Generated.xcconfig
+          # pub get 升级了依赖，新插件要求更高的 iOS deployment target。
+          # 只在 runner 副本上把 12/13 提到 16（不动本地源码）。
+          python3 - <<'PY'
+          import re
+          p = "ios/Podfile"
+          s = open(p).read()
+          s = re.sub(r"platform :ios, '[\d.]+'", "platform :ios, '16.0'", s)
+          open(p, "w").write(s)
+          p = "ios/Runner.xcodeproj/project.pbxproj"
+          s = open(p).read()
+          s = re.sub(r"IPHONEOS_DEPLOYMENT_TARGET = [\d.]+;",
+                     "IPHONEOS_DEPLOYMENT_TARGET = 16.0;", s)
+          open(p, "w").write(s)
+          print("deployment target -> 16.0")
+          PY
           cd ios
           pod install --repo-update
 
