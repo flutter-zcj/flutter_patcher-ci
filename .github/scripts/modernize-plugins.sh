@@ -53,9 +53,20 @@ modernize_plugins() {
     n=$((n + 1))
   done < <(sort -u "$touched")
 
+  # Remember the repaired package dirs for seed_patcher_cache: patcher runs
+  # its own pub get with a private PUB_CACHE and would otherwise re-download
+  # pristine copies, undoing these repairs.
+  cat "$touched" >> "$MODERNIZED_LIST"
   rm -f "$touched"
   sort -u -o "$MODERNIZED_LIST" "$MODERNIZED_LIST" 2>/dev/null || true
   echo "  $n plugin file(s) modernized"
+}
+
+# True when patch validation rejected a native plugin because its sources
+# differ from the host baseline. After patcher's first run has downloaded
+# pristine copies, another modernize pass normally reconciles them.
+patch_native_change() {
+  grep -q "PATCH_NATIVE_CHANGE" "$1" 2>/dev/null
 }
 
 # Copy the already-repaired packages into the patcher's cache so its own

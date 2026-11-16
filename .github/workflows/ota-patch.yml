@@ -369,9 +369,14 @@ jobs:
             code=$?
             set -e
             [ "$code" -eq 0 ] && break
-            if [ "$attempt" -lt 3 ] && old_plugin_failure "$RUNNER_TEMP/patch.err"; then
-              echo "an old plugin blocked Gradle; modernizing and retrying (attempt $attempt)"
-              rm -rf "$HOME"/.flutter_patcher/builds/* "$PROJECT/build" "$PROJECT/android/.gradle"
+            # The host build retried once after its first attempt: the first
+            # patcher run downloads pristine plugin copies into its private
+            # cache, and the second modernize_plugins pass repairs them. The
+            # baseline was captured in that repaired state, so a patch must
+            # reach the same state before its source fingerprints are compared.
+            if [ "$attempt" -lt 3 ] && { old_plugin_failure "$RUNNER_TEMP/patch.err" || patch_native_change "$RUNNER_TEMP/patch.err"; }; then
+              echo "native plugin sources differ from the host baseline; modernizing and retrying (attempt $attempt)"
+              rm -rf "$HOME"/.flutter_patcher/builds/* "$HOME"/.flutter_patcher/patches/run.pending-* "$PROJECT/build" "$PROJECT/android/.gradle"
               modernize_plugins
               seed_patcher_cache
               continue
