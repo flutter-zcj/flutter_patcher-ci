@@ -166,11 +166,24 @@ jobs:
 
           echo "team=$TEAM_ID profile=$PROFILE_NAME bundle=$BUNDLE_ID"
 
-      # 用 python 把手动签名设置写进 Runner target（pbxproj），
-      # 因为 xcodebuild 命令行参数会应用到所有 target，CocoaPods 的 framework 会拒绝 profile。
-      - name: Apply manual signing to Runner target
+      - name: Build Flutter iOS (no codesign)
         working-directory: ${{ inputs.project_path }}
+        run: flutter build ios --release --no-codesign
+
+      - name: Archive + export Ad Hoc IPA
+        working-directory: ${{ inputs.project_path }}
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
         run: |
+          set -euo pipefail
+          DERIVED="$GITHUB_WORKSPACE/DerivedData"
+          ARCHIVE="$GITHUB_WORKSPACE/build/App.xcarchive"
+
+          # 关键：flutter build ios 已经跑完（此时 pbxproj 是原始格式，SPM 集成成功）。
+          # 现在才把手动签名设置写进 Runner target 的 pbxproj——转成 XML plist，
+          # xcodebuild 能读；若提前到 flutter build 之前，其 SPM 文本解析会失败。
+          # xcodebuild 命令行参数会应用到所有 target，CocoaPods framework 会拒绝 profile，
+          # 所以必须只写在 application target 上。
           python3 - "$BUNDLE_ID" <<'PY'
           import json, os, subprocess, sys
           app_id = sys.argv[1]
@@ -201,23 +214,9 @@ jobs:
               sys.exit("未找到 Runner application target")
           subprocess.run(["plutil", "-convert", "xml1", "-o", pbx, "-"],
                          input=json.dumps(data).encode(), check=True)
-          print(f"签名设置已写入 {hit} 个 build configuration")
+          print(f"签名设置已写入 {hit} 个 build configuration (bundle={app_id})")
           PY
 
-      - name: Build Flutter iOS (no codesign)
-        working-directory: ${{ inputs.project_path }}
-        run: flutter build ios --release --no-codesign
-
-      - name: Archive + export Ad Hoc IPA
-        working-directory: ${{ inputs.project_path }}
-        env:
-          BUILD_ID: ${{ inputs.build_id }}
-        run: |
-          set -euo pipefail
-          DERIVED="$GITHUB_WORKSPACE/DerivedData"
-          ARCHIVE="$GITHUB_WORKSPACE/build/App.xcarchive"
-
-          # archive（手动签名设置已在 pbxproj 里）
           xcodebuild \
             -workspace ios/Runner.xcworkspace \
             -scheme Runner \
