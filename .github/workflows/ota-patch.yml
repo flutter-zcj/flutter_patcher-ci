@@ -158,7 +158,7 @@ jobs:
           # package attribute). Repair them in the pub caches, seed the
           # patcher's cache so its own pub get reuses the repaired copies, and
           # retry: whatever it downloads fresh is repaired on the next attempt.
-          source .github/scripts/modernize-plugins.sh
+          source "$GITHUB_WORKSPACE/.github/scripts/modernize-plugins.sh"
           modernize_plugins
           seed_patcher_cache
           attempt=0
@@ -345,7 +345,7 @@ jobs:
           cd "$PROJECT"
           flutter pub get
           # Same old-plugin repairs as the host build; see the script.
-          source .github/scripts/modernize-plugins.sh
+          source "$GITHUB_WORKSPACE/.github/scripts/modernize-plugins.sh"
           modernize_plugins
           seed_patcher_cache
           attempt=0
