@@ -141,6 +141,9 @@ jobs:
           APPLICATION_ID: ${{ inputs.application_id }}
           STRATEGY: ${{ inputs.strategy }}
           BUILD_ARGS: ${{ inputs.build_args }}
+          # A big app needs more than the default 2 GiB: JetifyTransform of
+          # flutter.jar dies with "Java heap space" otherwise.
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx4096m -Dorg.gradle.workers.max=2
         run: |
           set -euo pipefail
           cd "$PROJECT"
