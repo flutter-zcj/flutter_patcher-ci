@@ -69,6 +69,19 @@ jobs:
     if: inputs.mode == 'host'
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          # A big Flutter app plus the NDK and two Gradle runs do not fit the
+          # default image. Drop toolchains this build never uses. NDK 27 and
+          # 28 stay: flutter_patcher's plugin pins 27, the engine needs 28.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android/sdk/system-images
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/2[0-6]*
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/2[0-6].* 2>/dev/null || true
+          df -h / | tail -1
+
       - name: Restore the source snapshot
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -140,10 +153,10 @@ jobs:
           # stdout is the JSON report; warnings go to stderr.
           #
           # Gradle 9 removed jcenter(); some 2021-era plugins (amap_flutter_location
-          # 3.0.0) still call it and the Gradle evaluation dies. flutter_patcher
-          # resolves into its own PUB_CACHE under ~/.flutter_patcher, which only
-          # exists once it has run, so: build, and if that is what failed, rewrite
-          # the dead repository and build again.
+          # 3.0.0, no newer release) still call it and Gradle evaluation dies.
+          # flutter_patcher resolves into its own PUB_CACHE under
+          # ~/.flutter_patcher, so seed that cache from the project's, already
+          # patched; the patcher then reuses it instead of downloading.
           fix_jcenter() {
             local changed=0
             for f in $(grep -rl "jcenter()" "$PUB_CACHE/hosted" ~/.flutter_patcher/pub-cache/hosted 2>/dev/null); do
@@ -153,6 +166,22 @@ jobs:
             done
             echo "  $changed file(s) patched"
           }
+          seed_patcher_cache() {
+            local target="$HOME/.flutter_patcher/pub-cache/hosted/pub.dev"
+            mkdir -p "$target"
+            local n=0
+            for f in $(grep -rl "jcenter()" "$PUB_CACHE/hosted" 2>/dev/null); do
+              local pkg
+              pkg=$(basename "$(dirname "$(dirname "$f")")")
+              local src="$PUB_CACHE/hosted/pub.dev/$pkg"
+              [ -d "$src" ] || continue
+              sed -i 's/jcenter()/mavenCentral()/g' "$src/android/build.gradle" 2>/dev/null || true
+              cp -R "$src" "$target/" 2>/dev/null && echo "  seeded $pkg"
+              n=$((n + 1))
+            done
+            echo "  $n package(s) seeded"
+          }
+          seed_patcher_cache
           attempt=0
           while :; do
             attempt=$((attempt + 1))
@@ -164,6 +193,9 @@ jobs:
             if [ "$code" -eq 0 ]; then break; fi
             if grep -q "jcenter()" "$RUNNER_TEMP/build.err" && [ "$attempt" -lt 2 ]; then
               echo "jcenter() is gone in Gradle 9; patching the plugin and retrying (attempt $attempt)"
+              # A failed run keeps its whole project copy; drop it before
+              # building again or the runner runs out of disk.
+              rm -rf "$HOME"/.flutter_patcher/builds/* "$PROJECT/build" "$PROJECT/android/.gradle"
               fix_jcenter
               continue
             fi
@@ -249,6 +281,19 @@ jobs:
     if: inputs.mode == 'patch'
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          # A big Flutter app plus the NDK and two Gradle runs do not fit the
+          # default image. Drop toolchains this build never uses. NDK 27 and
+          # 28 stay: flutter_patcher's plugin pins 27, the engine needs 28.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android/sdk/system-images
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/2[0-6]*
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/2[0-6].* 2>/dev/null || true
+          df -h / | tail -1
+
       - name: Restore the source snapshot
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -318,7 +363,7 @@ jobs:
           cd "$PROJECT"
           flutter pub get
           # Same jcenter() problem as the host build: the plugin Gradle evaluates
-          # lives in flutter_patcher's own cache, which appears only after a run.
+          # lives in flutter_patcher's own cache, so seed it, patched.
           fix_jcenter() {
             local changed=0
             for f in $(grep -rl "jcenter()" "$PUB_CACHE/hosted" ~/.flutter_patcher/pub-cache/hosted 2>/dev/null); do
@@ -328,6 +373,19 @@ jobs:
             done
             echo "  $changed file(s) patched"
           }
+          seed_patcher_cache() {
+            local target="$HOME/.flutter_patcher/pub-cache/hosted/pub.dev"
+            mkdir -p "$target"
+            for f in $(grep -rl "jcenter()" "$PUB_CACHE/hosted" 2>/dev/null); do
+              local pkg
+              pkg=$(basename "$(dirname "$(dirname "$f")")")
+              local src="$PUB_CACHE/hosted/pub.dev/$pkg"
+              [ -d "$src" ] || continue
+              sed -i 's/jcenter()/mavenCentral()/g' "$src/android/build.gradle" 2>/dev/null || true
+              cp -R "$src" "$target/" 2>/dev/null && echo "  seeded $pkg"
+            done
+          }
+          seed_patcher_cache
           attempt=0
           while :; do
             attempt=$((attempt + 1))
@@ -338,6 +396,7 @@ jobs:
             if [ "$code" -eq 0 ]; then break; fi
             if grep -q "jcenter()" "$RUNNER_TEMP/patch.err" && [ "$attempt" -lt 2 ]; then
               echo "jcenter() is gone in Gradle 9; patching the plugin and retrying (attempt $attempt)"
+              rm -rf "$HOME"/.flutter_patcher/builds/* "$PROJECT/build" "$PROJECT/android/.gradle"
               fix_jcenter
               continue
             fi
