@@ -138,11 +138,37 @@ jobs:
           if [ -n "$APPLICATION_ID" ]; then extra="--application-id $APPLICATION_ID"; fi
           if [ -n "$STRATEGY" ]; then extra="$extra --strategy $STRATEGY"; fi
           # stdout is the JSON report; warnings go to stderr.
-          set +e
-          dart run flutter_patcher build android $extra \
-            > "$RUNNER_TEMP/build.json" 2> "$RUNNER_TEMP/build.err"
-          code=$?
-          set -e
+          #
+          # Gradle 9 removed jcenter(); some 2021-era plugins (amap_flutter_location
+          # 3.0.0) still call it and the Gradle evaluation dies. flutter_patcher
+          # resolves into its own PUB_CACHE under ~/.flutter_patcher, which only
+          # exists once it has run, so: build, and if that is what failed, rewrite
+          # the dead repository and build again.
+          fix_jcenter() {
+            local changed=0
+            for f in $(grep -rl "jcenter()" "$PUB_CACHE/hosted" ~/.flutter_patcher/pub-cache/hosted 2>/dev/null); do
+              sed -i 's/jcenter()/mavenCentral()/g' "$f"
+              echo "  patched $f"
+              changed=$((changed + 1))
+            done
+            echo "  $changed file(s) patched"
+          }
+          attempt=0
+          while :; do
+            attempt=$((attempt + 1))
+            set +e
+            dart run flutter_patcher build android $extra \
+              > "$RUNNER_TEMP/build.json" 2> "$RUNNER_TEMP/build.err"
+            code=$?
+            set -e
+            if [ "$code" -eq 0 ]; then break; fi
+            if grep -q "jcenter()" "$RUNNER_TEMP/build.err" && [ "$attempt" -lt 2 ]; then
+              echo "jcenter() is gone in Gradle 9; patching the plugin and retrying (attempt $attempt)"
+              fix_jcenter
+              continue
+            fi
+            break
+          done
           echo "exit=$code stdout=$(wc -c < "$RUNNER_TEMP/build.json") bytes stderr=$(wc -c < "$RUNNER_TEMP/build.err") bytes"
           if [ -s "$RUNNER_TEMP/build.err" ]; then
             echo "----- stderr head -----"
@@ -291,9 +317,35 @@ jobs:
           set -euo pipefail
           cd "$PROJECT"
           flutter pub get
-          out="$(dart run flutter_patcher patch android)"
-          echo "$out"
-          echo "$out" > "$RUNNER_TEMP/patch.json"
+          # Same jcenter() problem as the host build: the plugin Gradle evaluates
+          # lives in flutter_patcher's own cache, which appears only after a run.
+          fix_jcenter() {
+            local changed=0
+            for f in $(grep -rl "jcenter()" "$PUB_CACHE/hosted" ~/.flutter_patcher/pub-cache/hosted 2>/dev/null); do
+              sed -i 's/jcenter()/mavenCentral()/g' "$f"
+              echo "  patched $f"
+              changed=$((changed + 1))
+            done
+            echo "  $changed file(s) patched"
+          }
+          attempt=0
+          while :; do
+            attempt=$((attempt + 1))
+            set +e
+            dart run flutter_patcher patch android > "$RUNNER_TEMP/patch.json" 2> "$RUNNER_TEMP/patch.err"
+            code=$?
+            set -e
+            if [ "$code" -eq 0 ]; then break; fi
+            if grep -q "jcenter()" "$RUNNER_TEMP/patch.err" && [ "$attempt" -lt 2 ]; then
+              echo "jcenter() is gone in Gradle 9; patching the plugin and retrying (attempt $attempt)"
+              fix_jcenter
+              continue
+            fi
+            echo "patch failed (exit $code)"
+            fold -w 300 "$RUNNER_TEMP/patch.err" | tail -40
+            exit "$code"
+          done
+          cat "$RUNNER_TEMP/patch.json"
           python3 - "$RUNNER_TEMP/patch.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json, sys
           report = json.load(open(sys.argv[1]))
