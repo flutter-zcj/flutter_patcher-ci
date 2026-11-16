@@ -81,7 +81,12 @@ jobs:
         working-directory: ${{ inputs.project_path }}
         run: |
           set -e
+          # 快照里的 Generated.xcconfig / .flutter-plugins 带的是开发机旧 FLUTTER_ROOT，
+          # 必须删掉让 flutter pub get 用当前 SDK 重新生成，否则 Podfile 里 flutter_root 读错路径。
+          rm -f ios/Flutter/Generated.xcconfig ios/Flutter/flutter_export_environment.sh
+          rm -f .flutter-plugins .flutter-plugins-dependencies
           flutter pub get
+          grep FLUTTER_ROOT ios/Flutter/Generated.xcconfig
           cd ios
           pod install --repo-update
 
