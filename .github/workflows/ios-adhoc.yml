@@ -1,0 +1,265 @@
+name: iOS Ad Hoc Build
+
+# 在 macOS runner 上构建并签名 zmoanew 的 Ad Hoc IPA。
+# 源码来自 src-cache release 的 src-zmoanew.tar.gz（保留绝对路径，path: 依赖闭包），
+# 与 Android OTA 复用同一份快照机制——因为工程在局域网 GitLab，runner 够不着。
+# 签名材料来自 secrets：IOS_CERTIFICATE_AD_HOC / IOS_CERTIFICATE_PASSWORD_AD_HOC /
+# IOS_PROVISIONING_PROFILE_AD_HOC，由 ios_provision.py 用 Admin key 生成并写入。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: '构建标识（用于 IPA 文件名）'
+        required: false
+        default: 'adhoc'
+        type: string
+      source_tag:
+        description: '源码快照 release tag'
+        required: false
+        default: 'src-cache'
+        type: string
+      source_asset:
+        description: '源码快照文件名'
+        required: false
+        default: 'src-zmoanew.tar.gz'
+        type: string
+      project_path:
+        description: '工程绝对路径（快照解包后）'
+        required: false
+        default: '/Users/zcj/D/work_zbcx/Flutter/code/oa/code/zmoanew'
+        type: string
+
+permissions:
+  contents: write   # 上传 IPA 到 release
+
+concurrency:
+  group: ios-adhoc
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # 快照保留 /Users/zcj/D/... 绝对路径。macOS runner 的 home 是 /Users/runner，
+      # 故需 sudo 建目录并以 root 解包，再把属主改回 runner，Flutter/CocoaPods 才能写。
+      - name: Restore source snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_TAG: ${{ inputs.source_tag }}
+          SRC_ASSET: ${{ inputs.source_asset }}
+          PROJECT: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users
+          mkdir -p "$RUNNER_TEMP/src"
+          gh release download "$SRC_TAG" -R "$GITHUB_REPOSITORY" \
+            -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber
+          sudo tar -xzf "$RUNNER_TEMP/src/$SRC_ASSET" -C /
+          # 把工程及所有 path 依赖的属主改成 runner
+          sudo chown -R "$(id -u):$(id -g)" /Users/zcj
+          test -f "$PROJECT/pubspec.yaml"
+          echo "源码已恢复到 $PROJECT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Install CocoaPods deps
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set -e
+          flutter pub get
+          cd ios
+          pod install --repo-update
+
+      # ---- 安装签名材料 ----
+      - name: Install certificate and provisioning profile
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE_AD_HOC }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD_AD_HOC }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE_AD_HOC }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*" >&2; exit 1; }
+
+          [ -n "${IOS_CERTIFICATE:-}" ] || fail "secret IOS_CERTIFICATE_AD_HOC 未配置"
+          [ -n "${IOS_PROVISIONING_PROFILE:-}" ] || fail "secret IOS_PROVISIONING_PROFILE_AD_HOC 未配置"
+
+          # 解 profile，读出 team / profile 名 / bundle id / 类型
+          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          echo "$IOS_PROVISIONING_PROFILE" | base64 --decode > "$PROFILE_PATH"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_UUID=$(plutil -extract UUID raw -o - "$PROFILE_PLIST")
+          TEAM_ID=$(plutil -extract TeamIdentifier.0 raw -o - "$PROFILE_PLIST")
+          PROFILE_NAME=$(plutil -extract Name raw -o - "$PROFILE_PLIST")
+          APP_ID=$(plutil -extract Entitlements.application-identifier raw -o - "$PROFILE_PLIST")
+          BUNDLE_ID=${APP_ID#"$TEAM_ID".}
+          # 校验确实是 ad-hoc profile（有 ProvisionedDevices 且 get-task-allow=false）
+          plutil -extract ProvisionedDevices raw -o /dev/null "$PROFILE_PLIST" \
+            || fail "该 profile 不含设备列表，不是 Ad Hoc 类型"
+          GTA=$(plutil -extract Entitlements.get-task-allow raw -o - "$PROFILE_PLIST" 2>/dev/null || echo false)
+          [ "$GTA" != "true" ] || fail "该 profile 是 Development 类型（get-task-allow=true），不是 Ad Hoc"
+
+          # 建临时 keychain 并导入 p12
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$IOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "${IOS_CERTIFICATE_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          # 确认有 Apple Distribution 签名身份
+          IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")
+          echo "$IDENTITIES"
+          echo "$IDENTITIES" | grep -q "Apple Distribution" \
+            || fail "p12 中没有 Apple Distribution 签名身份"
+
+          # 安装 profile 到系统目录
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+
+          # 传给后续步骤
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+          echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "CODE_SIGN_IDENTITY=Apple Distribution" >> "$GITHUB_ENV"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+
+          echo "team=$TEAM_ID profile=$PROFILE_NAME bundle=$BUNDLE_ID"
+
+      # 用 python 把手动签名设置写进 Runner target（pbxproj），
+      # 因为 xcodebuild 命令行参数会应用到所有 target，CocoaPods 的 framework 会拒绝 profile。
+      - name: Apply manual signing to Runner target
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          python3 - "$BUNDLE_ID" <<'PY'
+          import json, os, subprocess, sys
+          app_id = sys.argv[1]
+          pbx = "ios/Runner.xcodeproj/project.pbxproj"
+          data = json.loads(subprocess.check_output(
+              ["plutil", "-convert", "json", "-o", "-", pbx]))
+          objects = data["objects"]
+          settings = {
+              "CODE_SIGN_STYLE": "Manual",
+              "DEVELOPMENT_TEAM": os.environ["TEAM_ID"],
+              "PROVISIONING_PROFILE_SPECIFIER": os.environ["PROFILE_NAME"],
+              "CODE_SIGN_IDENTITY": os.environ["CODE_SIGN_IDENTITY"],
+          }
+          hit = 0
+          for obj in objects.values():
+              if obj.get("isa") != "PBXNativeTarget":
+                  continue
+              if obj.get("productType") != "com.apple.product-type.application":
+                  continue
+              conf_list = objects[obj["buildConfigurationList"]]
+              for cid in conf_list["buildConfigurations"]:
+                  build = objects[cid].setdefault("buildSettings", {})
+                  for k in [k for k in build if k.split("[")[0] in settings]:
+                      del build[k]
+                  build.update(settings)
+                  hit += 1
+          if not hit:
+              sys.exit("未找到 Runner application target")
+          subprocess.run(["plutil", "-convert", "xml1", "-o", pbx, "-"],
+                         input=json.dumps(data).encode(), check=True)
+          print(f"签名设置已写入 {hit} 个 build configuration")
+          PY
+
+      - name: Build Flutter iOS (no codesign)
+        working-directory: ${{ inputs.project_path }}
+        run: flutter build ios --release --no-codesign
+
+      - name: Archive + export Ad Hoc IPA
+        working-directory: ${{ inputs.project_path }}
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          set -euo pipefail
+          DERIVED="$GITHUB_WORKSPACE/DerivedData"
+          ARCHIVE="$GITHUB_WORKSPACE/build/App.xcarchive"
+
+          # archive（手动签名设置已在 pbxproj 里）
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED" \
+            -archivePath "$ARCHIVE" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            -quiet archive
+
+          # 生成 ExportOptions.plist（method=ad-hoc）
+          python3 - <<'PY'
+          import os, plistlib
+          opts = {
+              "method": "ad-hoc",
+              "signingStyle": "manual",
+              "teamID": os.environ["TEAM_ID"],
+              "provisioningProfiles": {os.environ["BUNDLE_ID"]: os.environ["PROFILE_NAME"]},
+              "manageAppVersionAndBuildNumber": False,
+          }
+          with open("ExportOptions.plist", "wb") as f:
+              plistlib.dump(opts, f)
+          PY
+
+          mkdir -p build/export
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE" \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath build/export
+
+          IPA=$(find build/export -name '*.ipa' | head -1)
+          [ -n "$IPA" ] || { echo "::error::未生成 IPA"; exit 1; }
+          cp "$IPA" "build/${BUILD_ID}.ipa"
+          echo "✅ IPA: build/${BUILD_ID}.ipa"
+          ls -lh "build/${BUILD_ID}.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-adhoc
+          path: ${{ inputs.project_path }}/build/${{ inputs.build_id }}.ipa
+          retention-days: 14
+
+      - name: Attach IPA to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_ID: ${{ inputs.build_id }}
+          PROJECT: ${{ inputs.project_path }}
+        run: |
+          set -e
+          IPA="$PROJECT/build/${BUILD_ID}.ipa"
+          gh release upload ios-adhoc-latest \
+            "$IPA#zmoa-${BUILD_ID}.ipa" \
+            -R "$GITHUB_REPOSITORY" --clobber 2>/dev/null || {
+            echo "release 不存在，创建中..."
+            gh release create ios-adhoc-latest \
+              "$IPA#zmoa-${BUILD_ID}.ipa" \
+              -R "$GITHUB_REPOSITORY" --title "iOS Ad Hoc IPA" --notes "最新 Ad Hoc 构建"
+          }
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ] && \
+            security delete-keychain "$KEYCHAIN_PATH" || true
