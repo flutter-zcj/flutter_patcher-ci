@@ -359,32 +359,54 @@ jobs:
           [ -n "$SDK_DIR" ] && [ -d "$SDK_DIR/packages/flutter" ] || { echo "::error::managed SDK 未就绪"; exit 1; }
           echo "managed SDK: $SDK_DIR"
 
-          echo "=== patch managed SDK: 重命名 CupertinoDesktopTextSelectionToolbarButton.text ==="
+          echo "=== patch managed SDK: 自动重命名所有 .text 命名构造函数 ==="
           python3 - "$SDK_DIR" <<'PY'
-          import os, sys
+          import os, re, sys
           sdk = sys.argv[1]
-          targets = [
-              "packages/flutter/lib/src/cupertino/desktop_text_selection_toolbar_button.dart",
-              "packages/flutter/lib/src/cupertino/desktop_text_selection.dart",
-              "packages/flutter/lib/src/material/adaptive_text_selection_toolbar.dart",
-          ]
+          lib = os.path.join(sdk, "packages", "flutter", "lib")
+          if not os.path.isdir(lib):
+              sys.exit(f"找不到 framework lib: {lib}")
+
+          # 1) 找出所有「有 ClassName.text({ 命名构造函数 + final String? text; 实例字段」的类。
+          #    extract-surface 会把这种命名构造函数误判成实例成员，导致 baseline-kernel 失败。
+          targets = set()
+          for dirpath, _, files in os.walk(lib):
+              for name in files:
+                  if not name.endswith(".dart"):
+                      continue
+                  try:
+                      s = open(os.path.join(dirpath, name), encoding="utf-8").read()
+                  except Exception:
+                      continue
+                  for m in re.finditer(r"class\s+([A-Z][A-Za-z0-9_]*)\b", s):
+                      cls = m.group(1)
+                      if (re.search(r"\b" + re.escape(cls) + r"\.text\(", s)
+                              and re.search(r"final\s+String\?\s+text\s*;", s)):
+                          targets.add(cls)
+
+          if not targets:
+              sys.exit("未找到需要改名的类：源码结构可能已变，请检查")
+
+          # 2) 全 framework 里把 ClassName.text( 改成 ClassName.fromText(（精确到类名，不碰别的 .text）
           total = 0
-          for rel in targets:
-              p = os.path.join(sdk, rel)
-              if not os.path.exists(p):
-                  print(f"  警告：{rel} 不存在")
-                  continue
-              s = open(p, encoding="utf-8").read()
-              n = s.count("CupertinoDesktopTextSelectionToolbarButton.text(")
-              if n:
-                  s = s.replace("CupertinoDesktopTextSelectionToolbarButton.text(",
-                                "CupertinoDesktopTextSelectionToolbarButton.fromText(")
-                  open(p, "w", encoding="utf-8").write(s)
-                  total += n
-                  print(f"  patch {rel}: {n} 处")
-          print(f"共改名 {total} 处")
-          if total == 0:
-              sys.exit("未能改名：源码结构可能已变，请检查")
+          for dirpath, _, files in os.walk(lib):
+              for name in files:
+                  if not name.endswith(".dart"):
+                      continue
+                  p = os.path.join(dirpath, name)
+                  try:
+                      s = open(p, encoding="utf-8").read()
+                  except Exception:
+                      continue
+                  orig = s
+                  for cls in targets:
+                      s = s.replace(cls + ".text(", cls + ".fromText(")
+                  if s != orig:
+                      open(p, "w", encoding="utf-8").write(s)
+                      total += 1
+                      print(f"  patch: {os.path.relpath(p, lib)}")
+          print(f"改名类: {sorted(targets)}")
+          print(f"改动文件数: {total}")
           PY
 
           # --out：产物目录（必须是全新不存在的路径）
