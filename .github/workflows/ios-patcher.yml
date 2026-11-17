@@ -219,8 +219,9 @@ jobs:
       # 并同步改写所有调用点（不动用户本地源码）。
       # patcher 的 managed SDK / patched engine / 自带 pub-cache 都缓存在这里，
       # 不缓存的话每次都要重新 clone Flutter SDK（实测 15 分钟以上）。
-      - name: Cache flutter_patcher managed environment
-        uses: actions/cache@v4
+      - name: Restore flutter_patcher managed environment
+        id: fp-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.flutter_patcher
           key: fp-env-${{ runner.os }}-3.47.9-v2
@@ -269,7 +270,7 @@ jobs:
           "$MANAGED_SDK/bin/flutter" --version 2>&1 | head -3
           echo "=== 编译冒烟（release kernel）==="
           "$MANAGED_SDK/bin/flutter" --suppress-analytics build bundle \
-            --release --target lib/main.dart --no-pub 2>&1 | tail -40
+            --release --target lib/main.dart --no-pub 2>&1
           rm -rf build/flutter_assets
 
       - name: Build patcher host IPA (hot-update capable)
@@ -393,6 +394,15 @@ jobs:
           gh release create ios-patcher-latest "${ASSETS[@]}" \
             -R "$GITHUB_REPOSITORY" --title "iOS Patcher Host IPA (hot-update)" \
             --notes "支持热更新的 patcher 宿主包（含基线）"
+
+      # 失败也要存，否则下一轮又要重新 clone SDK
+      - name: Save flutter_patcher managed environment
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.flutter_patcher
+          key: fp-env-${{ runner.os }}-3.47.9-v2
 
       - name: Cleanup keychain
         if: always()
