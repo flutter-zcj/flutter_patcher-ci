@@ -217,6 +217,16 @@ jobs:
       # iOS 只能 bytecode 策略，没有 --strategy so 的退路，故直接改名绕过：
       # 在 runner 的 managed SDK + pub-cache + 工程副本上把 ctor 名改为 from<Ctor>，
       # 并同步改写所有调用点（不动用户本地源码）。
+      # patcher 的 managed SDK / patched engine / 自带 pub-cache 都缓存在这里，
+      # 不缓存的话每次都要重新 clone Flutter SDK（实测 15 分钟以上）。
+      - name: Cache flutter_patcher managed environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.flutter_patcher
+          key: fp-env-${{ runner.os }}-3.47.9-v2
+          restore-keys: |
+            fp-env-${{ runner.os }}-3.47.9-
+
       - name: Warm managed SDK
         working-directory: ${{ inputs.project_path }}
         env:
@@ -243,9 +253,24 @@ jobs:
         run: |
           set -euo pipefail
           python3 "$GITHUB_WORKSPACE/.github/scripts/normalize_named_ctors.py" \
-            --project "$PWD" --sdk "$MANAGED_SDK" --report "$RUNNER_TEMP/ctors.json"
+            --project "$PWD" --sdk "$MANAGED_SDK" \
+            --pub-cache "$HOME/.flutter_patcher/pub-cache" \
+            --report "$RUNNER_TEMP/ctors.json"
           echo "=== 冲突明细（最多 60 行）==="
           python3 -c "import json;d=json.load(open('$RUNNER_TEMP/ctors.json'));print(len(d['collisions']),'处冲突');[print(' ',c['class']+'.'+c['ctor'],'->',c['new']) for c in d['collisions']]"
+
+      # 先用 managed SDK 自己编译一次 kernel：这一步失败 → 是源码/改名的问题；
+      # 通过而 patcher 仍失败 → 是 patcher pipeline 的问题。省得盲猜。
+      - name: Smoke compile with managed SDK
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          echo "=== managed SDK: $MANAGED_SDK ==="
+          "$MANAGED_SDK/bin/flutter" --version 2>&1 | head -3
+          echo "=== 编译冒烟（release kernel）==="
+          "$MANAGED_SDK/bin/flutter" --suppress-analytics build bundle \
+            --release --target lib/main.dart --no-pub 2>&1 | tail -40
+          rm -rf build/flutter_assets
 
       - name: Build patcher host IPA (hot-update capable)
         working-directory: ${{ inputs.project_path }}
@@ -278,7 +303,24 @@ jobs:
             echo "----- patcher stderr tail -----"
             fold -w 300 "$RUNNER_TEMP/patcher.err" | tail -60
           fi
-          [ "$code" -eq 0 ] || { echo "::error::patcher build 失败 (exit=$code)"; exit "$code"; }
+          if [ "$code" -ne 0 ]; then
+            echo "::error::patcher build 失败 (exit=$code)"
+            echo "----- patcher stderr 全量 -----"
+            fold -w 300 "$RUNNER_TEMP/patcher.err" 2>/dev/null || true
+            echo "----- evidence 目录 -----"
+            for d in "$HOME"/.flutter_patcher/builds/run.pending-*; do
+              [ -d "$d" ] || continue
+              echo "== $d =="
+              find "$d" -maxdepth 1 -type f | head -20
+              for f in failure.json log.txt build.log steps.json; do
+                if [ -f "$d/$f" ]; then
+                  echo "--- $f ---"
+                  tail -100 "$d/$f"
+                fi
+              done
+            done
+            exit "$code"
+          fi
 
           echo "=== patcher build.json ==="
           cat "$RUNNER_TEMP/patcher.json"
