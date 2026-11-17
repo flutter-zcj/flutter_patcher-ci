@@ -244,6 +244,72 @@ jobs:
           PY
           echo "=== 注入结果抽查 ===" && grep -c "CODE_SIGN_STYLE = Manual" ios/Runner.xcodeproj/project.pbxproj && grep -m1 "PROVISIONING_PROFILE_SPECIFIER" ios/Runner.xcodeproj/project.pbxproj
 
+          # ---- 绕过 flutter_patcher 上游 bug（issue #14）----
+          # extract-surface 把 CupertinoDesktopTextSelectionToolbarButton 的命名构造函数 .text
+          # 误判成实例成员，只要 App import package:flutter/cupertino.dart 就必现：
+          #   BUILD_STEP_FAILED: baseline-kernel failed: Expected instance member ...text
+          # Android 能用 --strategy so 绕过，iOS 只能 bytecode，没这条路。
+          # 本工程里引用 cupertino 的文件全是死 import（未使用任何 Cupertino 符号），
+          # 移除后 extract-surface 不再扫描 cupertino 库，即可绕过。
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          # 覆盖主工程 + 全部 path 依赖：读 package_config 拿到每个包的 rootUri
+          pkg_cfg = json.load(open(".dart_tool/package_config.json"))
+          flutter_root = os.environ.get("FLUTTER_ROOT", "").rstrip("/")
+          roots = set()
+          for pkg in pkg_cfg.get("packages", []):
+              uri = pkg.get("rootUri", "")
+              if uri.startswith("file://"):
+                  path = uri[len("file://"):]
+              elif uri.startswith("../") or uri.startswith("./"):
+                  path = os.path.normpath(os.path.join(".dart_tool", uri))
+              else:
+                  continue
+              if not path.startswith("/"):
+                  continue
+              # 跳过 pub cache 里的 hosted 包
+              if "/.pub-cache/" in path:
+                  continue
+              # 关键：绝不碰 Flutter SDK 自身（否则会破坏 framework）
+              if flutter_root and (path == flutter_root or path.startswith(flutter_root + "/")):
+                  print(f"  跳过 Flutter SDK: {path}")
+                  continue
+              roots.add(path)
+          pat = re.compile(r"^\s*import\s+['\"]package:flutter/cupertino\.dart['\"]\s*;\s*\n", re.M)
+          removed = 0
+          for root in sorted(roots):
+              lib = os.path.join(root, "lib")
+              if not os.path.isdir(lib):
+                  continue
+              for dirpath, _, files in os.walk(lib):
+                  for name in files:
+                      if not name.endswith(".dart"):
+                          continue
+                      path = os.path.join(dirpath, name)
+                      try:
+                          src = open(path, encoding="utf-8").read()
+                      except Exception:
+                          continue
+                      if not pat.search(src):
+                          continue
+                      # 只在文件确实没用 Cupertino 符号时才删（死 import）
+                      if re.search(r"\bCupertino[A-Za-z]+\b|\bshowCupertino[A-Za-z]+\b", src):
+                          print(f"  保留（有实际使用）: {path}")
+                          continue
+                      new = pat.sub("", src)
+                      if new != src:
+                          open(path, "w", encoding="utf-8").write(new)
+                          removed += 1
+                          print(f"  移除死 import: {os.path.relpath(path, '/')}")
+          print(f"共移除 {removed} 处 cupertino 死 import")
+          # 复查：本地路径依赖里是否还有活的 cupertino 引用
+          still = subprocess.run(["bash", "-lc",
+              "grep -rl 'package:flutter/cupertino.dart' " +
+              " ".join(f"'{r}/lib'" for r in roots) + " 2>/dev/null || true"],
+              capture_output=True, text=True).stdout.strip()
+          print("剩余引用 cupertino 的文件:", still or "无")
+          PY
+
       - name: Build patcher host IPA (hot-update capable)
         working-directory: ${{ inputs.project_path }}
         env:
