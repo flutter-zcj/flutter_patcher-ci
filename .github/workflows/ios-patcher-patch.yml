@@ -175,6 +175,56 @@ jobs:
             -C "$PROJECT/.flutter_patcher/baselines"
           ls -lh "$PROJECT/.flutter_patcher/baselines"
 
+
+      # 宿主那次成功 build 是在「改名之后」跑的，pbxproj 的 SPM 引用、xcscheme、
+      # Package.resolved 都是那次 build 写出来的。补丁侧必须复现同样的后置状态。
+      - name: Rebuild native state (no codesign, after normalize)
+        if: always()
+        continue-on-error: true
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set +e
+          "$MANAGED_SDK/bin/flutter" --suppress-analytics build ios --release             --target lib/main.dart --no-codesign --no-pub 2>&1 | tail -30
+          echo "native rebuild exit=$?"
+
+      - name: Compare native files with baseline
+        if: always()
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import tarfile, json, os, hashlib, re
+          proj = os.getcwd()
+          bl = os.path.join(proj, ".flutter_patcher/baselines")
+          rel = [f for f in os.listdir(bl) if f.startswith("release-")][0]
+          with tarfile.open(os.path.join(bl, rel)) as tf:
+              receipt = json.load(tf.extractfile("release_receipt.json"))
+          app = re.search(r"^name: (\S+)", open("pubspec.yaml").read(), re.M).group(1)
+          nf = receipt["package_inputs"][app]["native_files"]
+          def sha(fp):
+              return hashlib.sha256(open(fp, "rb").read()).hexdigest()
+          missing, differ, extra = [], [], []
+          for k, v in nf.items():
+              fp = os.path.join(proj, k)
+              if not os.path.exists(fp): missing.append(k)
+              elif sha(fp) != v: differ.append(k)
+          skip = ("ios/Pods/", "ios/build/", "ios/.symlinks/")
+          excl = {"Generated.xcconfig", "flutter_export_environment.sh",
+                  "GeneratedPluginRegistrant.h", "GeneratedPluginRegistrant.m",
+                  "ephemeral", "build", ".dart_tool", ".git"}
+          for root, dirs, files in os.walk(os.path.join(proj, "ios")):
+              dirs[:] = [d for d in dirs if d not in excl]
+              for f in files:
+                  if f in excl: continue
+                  r = os.path.relpath(os.path.join(root, f), proj)
+                  if any(r.startswith(x) for x in skip): continue
+                  if r not in nf: extra.append(r)
+          print("baseline native_files:", len(nf))
+          print("缺失:", len(missing)); [print("  -", x) for x in missing[:20]]
+          print("内容不同:", len(differ)); [print("  ~", x) for x in differ[:20]]
+          print("多出:", len(extra)); [print("  +", x) for x in extra[:20]]
+          PY
+
       - name: Generate patch (.fptc)
         env:
           PROJECT: ${{ inputs.project_path }}
