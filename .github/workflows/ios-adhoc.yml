@@ -94,13 +94,22 @@ jobs:
           p = "ios/Podfile"
           s = open(p).read()
           s = re.sub(r"platform :ios, '[\d.]+'", "platform :ios, '16.0'", s)
+          # amap_flutter_location 3.0.0 的 podspec 未锁 AMapLocation 版本，
+          # 最新版 2.12.2 移除了 setReGeocodeLanguage API 导致编译失败。
+          # 锁定到本地已验证可编译的 2.11.0（复现本地 Podfile.lock）。
+          if "pod 'AMapLocation'" not in s:
+              s = s.replace(
+                  "  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))",
+                  "  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))\n"
+                  "  pod 'AMapLocation', '2.11.0'\n"
+                  "  pod 'AMapFoundation', '1.8.2'")
           open(p, "w").write(s)
           p = "ios/Runner.xcodeproj/project.pbxproj"
           s = open(p).read()
           s = re.sub(r"IPHONEOS_DEPLOYMENT_TARGET = [\d.]+;",
                      "IPHONEOS_DEPLOYMENT_TARGET = 16.0;", s)
           open(p, "w").write(s)
-          print("deployment target -> 16.0")
+          print("deployment target -> 16.0; AMapLocation pinned to 2.11.0")
           PY
           cd ios
           pod install --repo-update
