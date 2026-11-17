@@ -5,7 +5,7 @@ flutter_patcher 的 `build ios` 内部走 `flutter build ipa`，不会像旧 wor
 先 `--no-codesign` 再自己 xcodebuild，所以签名必须在 build 之前就写进工程；
 而它做 SPM 文本解析，pbxproj 不能转成 XML，只能做文本级注入。
 
-用法：prepare_ios_signing.py <bundle_id> <team_id> <profile_name> [project_dir]
+用法：prepare_ios_signing.py <bundle_id> <team_id> <profile_name> [project_dir] [version_code]
 """
 
 import os
@@ -14,8 +14,21 @@ import sys
 
 bundle, team, profile = sys.argv[1], sys.argv[2], sys.argv[3]
 project = sys.argv[4] if len(sys.argv) > 4 else os.getcwd()
+version_code = sys.argv[5] if len(sys.argv) > 5 else ""
 pbx = os.path.join(project, "ios/Runner.xcodeproj/project.pbxproj")
 src = open(pbx, encoding="utf-8").read()
+
+# 0) CFBundleVersion 取自 $(CURRENT_PROJECT_VERSION)，而 `flutter build ipa --build-number`
+#    不会改它（Info.plist 里引用的不是 FLUTTER_BUILD_NUMBER），默认值是 1。
+#    patcher 的 host policy 里 version_code 是 11，两边不一致会在 verify-ipa 阶段报
+#    "Actual app differs from immutable host policy"，所以这里直接写死成目标版本号。
+if version_code:
+    src, n = re.subn(
+        r"(CURRENT_PROJECT_VERSION\s*=\s*)[^;]+;",
+        lambda m: m.group(1) + version_code + ";",
+        src,
+    )
+    print(f"CURRENT_PROJECT_VERSION -> {version_code}（{n} 处）")
 
 # 1) 统一 bundle id（只改已有值的键，不动结构）
 src, count = re.subn(
