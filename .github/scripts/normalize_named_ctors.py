@@ -155,6 +155,19 @@ def dart_files(roots):
                     yield os.path.join(dirpath, name)
 
 
+def class_body_span(text, brace):
+    """brace 指向类体 '{'，返回 (body, 结尾 '}' 的下标)。"""
+    depth = 0
+    for i in range(brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace + 1:i], i
+    return "", brace
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", required=True, help="Flutter 工程根目录")
@@ -191,10 +204,19 @@ def main():
     for (cls, ctor) in sorted(found):
         renames.append((cls, ctor, new_name(ctor)))
 
-    patterns = [
-        (cls, ctor, nn, re.compile(r"\b" + re.escape(cls) + r"\." + re.escape(ctor) + r"\s*\("))
+    # 每个文件要处理三类位置：
+    #   1) 声明本身          —— Class.ctor(   （也覆盖 factory 重定向、tear-off）
+    #   2) 外部调用点        —— Class.ctor(
+    #   3) 子类里的超类调用  —— super.ctor(   （漏了这处就会出现
+    #      "Superclass has no constructor named 'ConstColorUint8.data'"）
+    call_patterns = [
+        (cls, ctor, nn, re.compile(r"\b" + re.escape(cls) + r"\." + re.escape(ctor) + r"\b"))
         for (cls, ctor, nn) in renames
     ]
+    ctor_map = {cls: {} for cls in {c for (c, _, _) in renames}}
+    for cls, ctor, nn in renames:
+        ctor_map[cls][ctor] = nn
+
     total_edits = 0
     for path in dart_files(roots):
         try:
@@ -202,23 +224,52 @@ def main():
         except Exception:
             continue
         new = src
-        for cls, ctor, nn, pattern in patterns:
-            new = pattern.sub(lambda m, _nn=nn, _cls=cls: f"{_cls}.{_nn}(", new)
+
+        # (1)(2) Class.ctor 的声明与调用
+        for cls, ctor, nn, pattern in call_patterns:
+            new = pattern.sub(lambda m, _cls=cls, _nn=nn: f"{_cls}.{_nn}", new)
+
+        # (3) 子类里的 super.ctor(
+        for m in re.finditer(r"^class\s+[A-Za-z_]\w*[^{;]*?\bextends\s+([\w.]+)", new, re.M):
+            sup = m.group(1).split(".")[-1]
+            pairs = ctor_map.get(sup)
+            if not pairs:
+                continue
+            brace = new.find("{", m.end())
+            if brace < 0:
+                continue
+            body, end = class_body_span(new, brace)
+            if not body:
+                continue
+            replaced = body
+            for ctor, nn in pairs.items():
+                replaced = re.sub(
+                    r"\bsuper\." + re.escape(ctor) + r"\b",
+                    f"super.{nn}",
+                    replaced,
+                )
+            if replaced != body:
+                new = new[:brace + 1] + replaced + new[end:]
+
         if new != src:
             if not args.dry_run:
                 open(path, "w", encoding="utf-8").write(new)
             total_edits += 1
 
-    # 复查：还有没有不带括号的裸引用（构造函数 tear-off），需要人工确认
+    # 复查：改名之后是否还有残留（含 super.ctor( 漏改）
     leftovers = []
     for path in dart_files(roots):
         try:
             src = open(path, encoding="utf-8", errors="replace").read()
         except Exception:
             continue
-        for cls, ctor, nn, pattern in patterns:
+        for cls, ctor, nn, pattern in call_patterns:
             if re.search(r"\b" + re.escape(cls) + r"\." + re.escape(ctor) + r"\b", src):
                 leftovers.append(f"{cls}.{ctor}  {path}")
+        for cls, pairs in ctor_map.items():
+            for ctor in pairs:
+                if re.search(r"\bsuper\." + re.escape(ctor) + r"\b", src):
+                    leftovers.append(f"super.{ctor}  {path}")
 
     print(f"改写 {total_edits} 个文件；改名 {len(renames)} 个构造函数")
     for cls, ctor, nn in renames:
