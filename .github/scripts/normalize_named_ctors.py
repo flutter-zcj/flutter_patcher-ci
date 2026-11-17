@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""归一化「命名构造函数名 == 同类实例成员名」的声明。
+
+背景
+----
+flutter_patcher 1.1.1 的 extract-surface 会把这类命名构造函数当成实例成员写进
+dynamic_interface，`baseline-kernel` 阶段用 --dynamic-interface 校验时报：
+    Build failed: Expected instance member <Class>.<ctor>
+已知触发类（Flutter 3.47.9）：
+    FilteringTextInputFormatter.allow / LinearBorder.bottom|top|start|end
+    InteractiveViewer.builder / Shortcuts.manager / CupertinoContextMenu.builder
+    CupertinoTextSelectionToolbarButton.text|buttonItem / ConstColorUint8.data …
+上游 issue #14 仍 open，iOS 只能 bytecode 策略，没有 --strategy so 的退路。
+
+做法
+----
+把所有「ctor 名与实例成员同名」的命名构造函数改名为 from<Ctor>，并把目标树里
+所有 `Class.ctor(` 调用点同步改名。只改构建副本（runner 上的 SDK / pub-cache /
+工程快照），不动用户本地源码。
+
+用法
+----
+  python3 normalize_named_ctors.py --project <app> --sdk <managed-sdk> \
+      [--report out.json] [--dry-run]
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+CLASS_RE = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)[^;{]*\{", re.M)
+FIELD_RE = re.compile(
+    r"^  (?:@override\s+)?(?:final|const|var|late)\s+[A-Za-z_][\w<>?,\s]*\s+([a-zA-Z_]\w*)\s*(?:=|;)",
+    re.M,
+)
+GETTER_RE = re.compile(r"^  (?:@override\s+)?[A-Za-z_][\w<>?,\s]*\s+get\s+([a-zA-Z_]\w*)", re.M)
+SETTER_RE = re.compile(r"^  (?:@override\s+)?set\s+([a-zA-Z_]\w*)\s*\(", re.M)
+METHOD_RE = re.compile(
+    r"^  (?:@override\s+)?[A-Za-z_][\w<>?,\s]*\s+([a-zA-Z_]\w*)\s*\([^;]*$", re.M
+)
+
+
+def class_body(text, brace_index):
+    depth = 0
+    for i in range(brace_index, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_index + 1 : i]
+    return ""
+
+
+def new_name(ctor):
+    """data -> fromData；text -> fromText；已有 from 前缀则加 _2 避免重名。"""
+    if ctor.startswith("_"):
+        return "_from" + ctor[1:]
+    cap = ctor[0].upper() + ctor[1:]
+    return "from" + cap
+
+
+def scan_file(path):
+    try:
+        src = open(path, encoding="utf-8", errors="replace").read()
+    except Exception:
+        return []
+    hits = []
+    for m in CLASS_RE.finditer(src):
+        cls = m.group(1)
+        body = class_body(src, m.end() - 1)
+        if not body:
+            continue
+        members = set()
+        for regex in (FIELD_RE, GETTER_RE, SETTER_RE, METHOD_RE):
+            members.update(regex.findall(body))
+        ctors = re.findall(
+            r"^  (?:const\s+|factory\s+)?" + re.escape(cls) + r"\.([A-Za-z_]\w*)\s*\(",
+            body,
+            re.M,
+        )
+        for ctor in sorted(set(ctors) & members):
+            hits.append((cls, ctor))
+    return hits
+
+
+def tree_roots(project, sdk):
+    """返回要扫描/改写的 lib 目录列表。"""
+    libs = [os.path.join(project, "lib")]
+
+    cfg = os.path.join(project, ".dart_tool/package_config.json")
+    if os.path.exists(cfg):
+        data = json.load(open(cfg))
+        base = os.path.join(project, ".dart_tool")
+        for pkg in data.get("packages", []):
+            uri = pkg.get("rootUri", "")
+            if uri.startswith("file://"):
+                root = uri[len("file://") :]
+            elif uri.startswith("..") or uri.startswith("./"):
+                root = os.path.normpath(os.path.join(base, uri))
+            else:
+                continue
+            lib = os.path.join(root, "lib")
+            if os.path.isdir(lib):
+                libs.append(lib)
+
+    if sdk:
+        packages = os.path.join(sdk, "packages")
+        if os.path.isdir(packages):
+            for name in sorted(os.listdir(packages)):
+                lib = os.path.join(packages, name, "lib")
+                if os.path.isdir(lib):
+                    libs.append(lib)
+        sky = os.path.join(sdk, "bin/cache/pkg/sky_engine/lib")
+        if os.path.isdir(sky):
+            libs.append(sky)
+
+    seen, unique = set(), []
+    for lib in libs:
+        real = os.path.realpath(lib)
+        if real in seen:
+            continue
+        seen.add(real)
+        unique.append(lib)
+    return unique
+
+
+def dart_files(roots):
+    for lib in roots:
+        for dirpath, _, files in os.walk(lib):
+            for name in files:
+                if name.endswith(".dart"):
+                    yield os.path.join(dirpath, name)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project", required=True, help="Flutter 工程根目录")
+    ap.add_argument("--sdk", default="", help="flutter_patcher managed SDK 根目录")
+    ap.add_argument("--report", default="", help="把结果写成 JSON")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    roots = tree_roots(os.path.abspath(args.project), args.sdk)
+    print(f"扫描 {len(roots)} 个 lib 目录")
+
+    found = {}
+    files = 0
+    for path in dart_files(roots):
+        files += 1
+        for cls, ctor in scan_file(path):
+            found.setdefault((cls, ctor), []).append(path)
+
+    print(f"扫描 {files} 个 dart 文件，命中 {len(found)} 处冲突：")
+    for (cls, ctor), paths in sorted(found.items()):
+        print(f"  {cls}.{ctor}  x{len(paths)}  ({paths[0]})")
+
+    if not found:
+        print("没有需要改名的构造函数")
+        if args.report:
+            json.dump({"collisions": [], "files_scanned": files}, open(args.report, "w"))
+        return
+
+    if args.dry_run:
+        return
+
+    renames = []
+    for (cls, ctor) in sorted(found):
+        renames.append((cls, ctor, new_name(ctor)))
+
+    patterns = [
+        (cls, ctor, nn, re.compile(r"\b" + re.escape(cls) + r"\." + re.escape(ctor) + r"\s*\("))
+        for (cls, ctor, nn) in renames
+    ]
+    total_edits = 0
+    for path in dart_files(roots):
+        try:
+            src = open(path, encoding="utf-8", errors="replace").read()
+        except Exception:
+            continue
+        new = src
+        for cls, ctor, nn, pattern in patterns:
+            new = pattern.sub(lambda m, _nn=nn, _cls=cls: f"{_cls}.{_nn}(", new)
+        if new != src:
+            if not args.dry_run:
+                open(path, "w", encoding="utf-8").write(new)
+            total_edits += 1
+
+    # 复查：还有没有不带括号的裸引用（构造函数 tear-off），需要人工确认
+    leftovers = []
+    for path in dart_files(roots):
+        try:
+            src = open(path, encoding="utf-8", errors="replace").read()
+        except Exception:
+            continue
+        for cls, ctor, nn, pattern in patterns:
+            if re.search(r"\b" + re.escape(cls) + r"\." + re.escape(ctor) + r"\b", src):
+                leftovers.append(f"{cls}.{ctor}  {path}")
+
+    print(f"改写 {total_edits} 个文件；改名 {len(renames)} 个构造函数")
+    for cls, ctor, nn in renames:
+        print(f"  {cls}.{ctor} -> {cls}.{nn}")
+    if leftovers:
+        print("⚠️ 仍残留（可能需要手工处理）：")
+        for item in leftovers[:20]:
+            print("  " + item)
+
+    if args.report:
+        json.dump(
+            {
+                "collisions": [{"class": c, "ctor": k, "new": n} for c, k, n in renames],
+                "files_scanned": files,
+                "files_rewritten": total_edits,
+                "leftovers": leftovers,
+            },
+            open(args.report, "w"),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
