@@ -333,6 +333,54 @@ jobs:
           # --export-method ad-hoc：走 iOS 手动签名（keychain 里已有 p12 identity）
           # --application-id：显式给 bundle id（避免 patcher 从工程读出多个/错误值）
           # --version-code：宿主 build number，必须非零整数，与补丁严格对应
+          # ---- 绕过 flutter_patcher 上游 bug（issue #14）----
+          # extract-surface 把 CupertinoDesktopTextSelectionToolbarButton 的命名构造函数 .text
+          # 误判成实例成员，只要 App 用到 Cupertino 组件就必现：
+          #   baseline-kernel failed: Expected instance member ...text
+          # iOS 只能 bytecode（不能用 --strategy so），所以直接给 patcher 的 managed SDK 打补丁：
+          # 把命名构造函数 .text 改名 .fromText（实例字段 text 保持不变），三处调用点同步改。
+          # managed SDK 从 git clone，改本地 SDK 无效，必须在 clone 之后改。
+          SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+          if [ -z "$SDK_DIR" ] || [ ! -d "$SDK_DIR/packages/flutter" ]; then
+            echo "=== 预热：让 patcher clone managed SDK（预期失败在 baseline-kernel，忽略）==="
+            dart run flutter_patcher build ios \
+              --application-id "$BUNDLE_ID" --version-code "$VERSION_CODE" \
+              --export-method ad-hoc --out "$GITHUB_WORKSPACE/patcher-warm" \
+              > /dev/null 2>&1 || true
+            rm -rf "$HOME"/.flutter_patcher/builds/run.pending-* "$GITHUB_WORKSPACE/patcher-warm"
+            SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+          fi
+          [ -n "$SDK_DIR" ] && [ -d "$SDK_DIR/packages/flutter" ] || { echo "::error::managed SDK 未就绪"; exit 1; }
+          echo "managed SDK: $SDK_DIR"
+
+          echo "=== patch managed SDK: 重命名 CupertinoDesktopTextSelectionToolbarButton.text ==="
+          python3 - "$SDK_DIR" <<'PY'
+          import os, sys
+          sdk = sys.argv[1]
+          targets = [
+              "packages/flutter/lib/src/cupertino/desktop_text_selection_toolbar_button.dart",
+              "packages/flutter/lib/src/cupertino/desktop_text_selection.dart",
+              "packages/flutter/lib/src/material/adaptive_text_selection_toolbar.dart",
+          ]
+          total = 0
+          for rel in targets:
+              p = os.path.join(sdk, rel)
+              if not os.path.exists(p):
+                  print(f"  警告：{rel} 不存在")
+                  continue
+              s = open(p, encoding="utf-8").read()
+              n = s.count("CupertinoDesktopTextSelectionToolbarButton.text(")
+              if n:
+                  s = s.replace("CupertinoDesktopTextSelectionToolbarButton.text(",
+                                "CupertinoDesktopTextSelectionToolbarButton.fromText(")
+                  open(p, "w", encoding="utf-8").write(s)
+                  total += n
+                  print(f"  patch {rel}: {n} 处")
+          print(f"共改名 {total} 处")
+          if total == 0:
+              sys.exit("未能改名：源码结构可能已变，请检查")
+          PY
+
           # --out：产物目录（必须是全新不存在的路径）
           OUT="$GITHUB_WORKSPACE/patcher-out/$BUILD_ID"
           rm -rf "$OUT"
