@@ -273,6 +273,28 @@ jobs:
             --release --target lib/main.dart --no-pub 2>&1
           rm -rf build/flutter_assets
 
+      # 诊断：patcher 内部就是跑这条 `flutter build ipa --export-method ad-hoc`，
+      # 它会把输出吞掉，失败只报 BUILD_IPA_INVALID。这里原样跑一遍看 xcodebuild 的报错。
+      - name: Diagnostic flutter build ipa (managed SDK)
+        if: always()
+        continue-on-error: true
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set +e
+          echo "=== codesigning identities ==="
+          security find-identity -v -p codesigning "${KEYCHAIN_PATH:-}" 2>&1 | head -10
+          echo "=== provisioning profiles ==="
+          ls -l "$HOME/Library/MobileDevice/Provisioning Profiles" 2>/dev/null | head
+          echo "=== flutter build ipa ==="
+          "$MANAGED_SDK/bin/flutter" --suppress-analytics build ipa --release \
+            --target lib/main.dart --build-number "$VERSION_CODE" \
+            --export-method ad-hoc --no-pub 2>&1 | tail -170
+          echo "=== 导出结果 ==="
+          ls -la build/ios/ipa 2>/dev/null || echo "(无 build/ios/ipa)"
+          find build/ios -maxdepth 2 -name '*.ipa' 2>/dev/null
+          rm -rf build/ios
+          exit 0
+
       - name: Build patcher host IPA (hot-update capable)
         working-directory: ${{ inputs.project_path }}
         env:
@@ -309,14 +331,14 @@ jobs:
             echo "----- patcher stderr 全量 -----"
             fold -w 300 "$RUNNER_TEMP/patcher.err" 2>/dev/null || true
             echo "----- evidence 目录 -----"
-            for d in "$HOME"/.flutter_patcher/builds/run.pending-*; do
+            for d in "$HOME"/.flutter_patcher/builds/*; do
               [ -d "$d" ] || continue
               echo "== $d =="
-              find "$d" -maxdepth 1 -type f | head -20
+              find "$d" -maxdepth 2 -type f | head -30
               for f in failure.json log.txt build.log steps.json; do
                 if [ -f "$d/$f" ]; then
                   echo "--- $f ---"
-                  tail -100 "$d/$f"
+                  tail -120 "$d/$f"
                 fi
               done
             done
