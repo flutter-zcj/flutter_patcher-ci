@@ -276,6 +276,7 @@ jobs:
                   continue
               roots.add(path)
           pat = re.compile(r"^\s*import\s+['\"]package:flutter/cupertino\.dart['\"]\s*;\s*\n", re.M)
+          mat_pat = re.compile(r"import\s+['\"]package:flutter/material\.dart['\"]")
           removed = 0
           for root in sorted(roots):
               lib = os.path.join(root, "lib")
@@ -292,16 +293,23 @@ jobs:
                           continue
                       if not pat.search(src):
                           continue
-                      # 只在文件确实没用 Cupertino 符号时才删（死 import）
+                      # 文件里有活的 Cupertino 符号就保留（改不动）
                       if re.search(r"\bCupertino[A-Za-z]+\b|\bshowCupertino[A-Za-z]+\b", src):
-                          print(f"  保留（有实际使用）: {path}")
+                          print(f"  保留（有实际 Cupertino 用法）: {os.path.relpath(path, '/')}")
                           continue
-                      new = pat.sub("", src)
+                      # 关键：若文件已 import material，直接删 cupertino 行；
+                      # 否则把它替换成 material（否则 Widget/Color 等基础类型全部未定义）。
+                      if mat_pat.search(src):
+                          new = pat.sub("", src)
+                          action = "删除"
+                      else:
+                          new = pat.sub("import 'package:flutter/material.dart';\n", src, count=1)
+                          action = "替换为 material"
                       if new != src:
                           open(path, "w", encoding="utf-8").write(new)
                           removed += 1
-                          print(f"  移除死 import: {os.path.relpath(path, '/')}")
-          print(f"共移除 {removed} 处 cupertino 死 import")
+                          print(f"  {action}: {os.path.relpath(path, '/')}")
+          print(f"共处理 {removed} 处 cupertino import")
           # 复查：本地路径依赖里是否还有活的 cupertino 引用
           still = subprocess.run(["bash", "-lc",
               "grep -rl 'package:flutter/cupertino.dart' " +
