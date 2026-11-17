@@ -1,0 +1,15 @@
+diff --git a/lib/application/application.dart b/lib/application/application.dart
+index 69f2407..cb3ad1e 100644
+--- a/lib/application/application.dart
++++ b/lib/application/application.dart
+@@ -37,8 +37,8 @@ class Application
+     //   initHttp();
+     // }
+ 
+-    // initHttp();
+-    initHttpTest();
++    initHttp();
++    // initHttpTest();
+     // initHttpDev();
+ 
+ 
