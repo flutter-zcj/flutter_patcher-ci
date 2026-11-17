@@ -211,6 +211,67 @@ jobs:
           python3 "$GITHUB_WORKSPACE/.github/scripts/prepare_ios_signing.py" \
             "$BUNDLE_ID" "$TEAM_ID" "$PROFILE_NAME" "$PWD"
 
+      # patcher 调 `flutter build ipa --export-method ad-hoc` 时不接受 --export-options-plist，
+      # 而 flutter 自动生成的 ExportOptions 里没有 provisioningProfiles，
+      # xcodebuild -exportArchive 会报 "requires a provisioning profile" → 导出 0 个 IPA。
+      # 这里在 PATH 上放一个 xcrun/xcodebuild 中转，只在 -exportArchive 时换成我们
+      # 已验证可用的 ExportOptions.plist（manual + provisioningProfiles）。
+      - name: Provide ExportOptions.plist via xcrun shim
+        run: |
+          set -euo pipefail
+          SHIM="$RUNNER_TEMP/xcshim"
+          rm -rf "$SHIM"; mkdir -p "$SHIM"
+          export PLIST_PATH="$RUNNER_TEMP/ExportOptions.plist"
+          python3 - "$PLIST_PATH" <<'PY'
+          import os, plistlib, sys
+          opts = {
+              "method": "ad-hoc",
+              "signingStyle": "manual",
+              "teamID": os.environ["TEAM_ID"],
+              "provisioningProfiles": {os.environ["BUNDLE_ID"]: os.environ["PROFILE_NAME"]},
+              "manageAppVersionAndBuildNumber": False,
+          }
+          with open(sys.argv[1], "wb") as f:
+              plistlib.dump(opts, f)
+          print("ExportOptions.plist:", opts)
+          PY
+          make_shim() {
+            local name="$1" real="$2"
+            cat > "$SHIM/$name" <<SHIM_EOF
+          #!/bin/bash
+          REAL="$real"
+          args=("\$@")
+          idx=-1
+          for i in "\${!args[@]}"; do
+            [ "\${args[\$i]}" = "xcodebuild" ] && { idx=\$i; break; }
+          done
+          if [ "\$idx" -ge 0 ]; then
+            archive=0; plist_next=-1
+            for ((j=idx+1; j<\${#args[@]}; j++)); do
+              case "\${args[\$j]}" in
+                -exportArchive) archive=1 ;;
+                -exportOptionsPlist) plist_next=\$((j+1)) ;;
+              esac
+            done
+            if [ "\$archive" = "1" ]; then
+              if [ "\$plist_next" -ge 0 ]; then
+                args[\$plist_next]="\$FP_EXPORT_PLIST"
+              else
+                args+=("-exportOptionsPlist" "\$FP_EXPORT_PLIST")
+              fi
+              echo "[shim] 注入 ExportOptions: \$FP_EXPORT_PLIST" >&2
+            fi
+          fi
+          exec "\$REAL" "\${args[@]}"
+          SHIM_EOF
+            chmod +x "$SHIM/$name"
+          }
+          make_shim xcrun "$(command -v xcrun)"
+          make_shim xcodebuild "$(command -v xcodebuild)"
+          echo "FP_EXPORT_PLIST=$PLIST_PATH" >> "$GITHUB_ENV"
+          echo "$SHIM" >> "$GITHUB_PATH"
+          echo "shim 就绪：$SHIM"
+
       # ---- 绕过 flutter_patcher 上游 bug（issue #14）----
       # extract-surface 把「命名构造函数与同类实例成员同名」的声明当成实例成员，
       # baseline-kernel 校验时报 `Expected instance member <Class>.<ctor>`。
@@ -287,7 +348,7 @@ jobs:
           ls -l "$HOME/Library/MobileDevice/Provisioning Profiles" 2>/dev/null | head
           echo "=== flutter build ipa ==="
           "$MANAGED_SDK/bin/flutter" --suppress-analytics build ipa --release \
-            --target lib/main.dart --build-number "$VERSION_CODE" \
+            --target lib/main.dart --build-number "${{ inputs.version_code }}" \
             --export-method ad-hoc --no-pub 2>&1 | tail -170
           echo "=== 导出结果 ==="
           ls -la build/ios/ipa 2>/dev/null || echo "(无 build/ios/ipa)"
