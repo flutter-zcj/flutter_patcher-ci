@@ -87,9 +87,28 @@ def scan_file(path):
     return hits
 
 
-def tree_roots(project, sdk):
+def hosted_libs(cache):
+    """pub-cache 目录下的所有包 lib（hosted/*/* 结构）。"""
+    out = []
+    hosted = os.path.join(cache, "hosted")
+    if not os.path.isdir(hosted):
+        return out
+    for server in sorted(os.listdir(hosted)):
+        server_dir = os.path.join(hosted, server)
+        if not os.path.isdir(server_dir):
+            continue
+        for pkg in sorted(os.listdir(server_dir)):
+            lib = os.path.join(server_dir, pkg, "lib")
+            if os.path.isdir(lib):
+                out.append(lib)
+    return out
+
+
+def tree_roots(project, sdk, pub_cache):
     """返回要扫描/改写的 lib 目录列表。"""
     libs = [os.path.join(project, "lib")]
+    if pub_cache:
+        libs.extend(hosted_libs(pub_cache))
 
     cfg = os.path.join(project, ".dart_tool/package_config.json")
     if os.path.exists(cfg):
@@ -140,11 +159,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", required=True, help="Flutter 工程根目录")
     ap.add_argument("--sdk", default="", help="flutter_patcher managed SDK 根目录")
+    ap.add_argument("--pub-cache", default="", help="额外的 pub-cache 目录（patcher 自带的 .flutter_patcher/pub-cache）")
     ap.add_argument("--report", default="", help="把结果写成 JSON")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    roots = tree_roots(os.path.abspath(args.project), args.sdk)
+    roots = tree_roots(os.path.abspath(args.project), args.sdk, args.pub_cache)
     print(f"扫描 {len(roots)} 个 lib 目录")
 
     found = {}
