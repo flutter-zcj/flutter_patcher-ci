@@ -224,7 +224,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.flutter_patcher
-          key: fp-env-${{ runner.os }}-3.47.9-v2
+          key: fp-env-${{ runner.os }}-3.47.9-v3
           restore-keys: |
             fp-env-${{ runner.os }}-3.47.9-
 
@@ -402,7 +402,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.flutter_patcher
-          key: fp-env-${{ runner.os }}-3.47.9-v2
+          key: fp-env-${{ runner.os }}-3.47.9-v3
 
       - name: Cleanup keychain
         if: always()
