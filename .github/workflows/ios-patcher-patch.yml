@@ -1,0 +1,226 @@
+name: iOS Patcher Incremental Patch
+
+# 为一个已发布的 patcher 宿主打「增量补丁」（.fptc）。
+#
+# 前置条件：宿主已经用 ios-patcher.yml 构建过，baseline 已上传到 release
+# （ios-baseline-<version_code>.tar.gz）。补丁必须用同一份 baseline，
+# 否则设备端指纹校验不过。
+#
+# 与 build 的区别：patch 只编译 Dart（iOS 是 bytecode 策略），不做原生构建，
+# 所以不需要证书/pod，也不需要 managed patched engine。
+#
+# 关键顺序（缺一不可）：
+#   1. 恢复源码快照（必须与宿主构建时同一份）
+#   2. 应用本次业务改动（patch 文件）
+#   3. 恢复 ~/.flutter_patcher 缓存（同一套 managed SDK / pub-cache）
+#   4. 把 baseline 放回工程 .flutter_patcher/baselines（本地 file store）
+#   5. 跑同一套 ctor 改名（接口必须与宿主完全一致）
+#   6. dart run flutter_patcher patch ios
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_id:
+        description: '补丁标识（产物/产物目录名）'
+        required: false
+        default: 'p11-http-init'
+        type: string
+      diff_path:
+        description: '本次改动的 patch 文件（相对仓库根目录）'
+        required: false
+        default: '.github/patches/fix-http-init.diff'
+        type: string
+      source_tag:
+        description: '源码快照 release tag'
+        required: false
+        default: 'src-cache'
+        type: string
+      source_asset:
+        description: '源码快照文件名'
+        required: false
+        default: 'src-zmoanew.tar.gz'
+        type: string
+      project_path:
+        description: '工程绝对路径（快照解包后）'
+        required: false
+        default: '/Users/zcj/D/work_zbcx/Flutter/code/oa/code/zmoanew'
+        type: string
+      version_code:
+        description: '宿主 build number（必须与宿主一致）'
+        required: false
+        default: '11'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-patcher-patch
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app
+          fi
+          xcodebuild -version || true
+
+      - name: Restore source snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_TAG: ${{ inputs.source_tag }}
+          SRC_ASSET: ${{ inputs.source_asset }}
+          PROJECT: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users
+          mkdir -p "$RUNNER_TEMP/src"
+          for attempt in 1 2 3; do
+            if gh release download "$SRC_TAG" -R "$GITHUB_REPOSITORY" \
+                 -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber; then break; fi
+            echo "下载失败（$attempt/3），10s 后重试"; sleep 10
+          done
+          sudo tar -xzf "$RUNNER_TEMP/src/$SRC_ASSET" -C /
+          sudo chown -R "$(id -u):$(id -g)" /Users/zcj
+          test -f "$PROJECT/pubspec.yaml"
+          echo "源码已恢复到 $PROJECT"
+
+      - name: Apply the change under patch
+        env:
+          PROJECT: ${{ inputs.project_path }}
+          DIFF: ${{ inputs.diff_path }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT"
+          patch -p1 --forward -i "$GITHUB_WORKSPACE/$DIFF"
+          echo "--- 改动后的关键行 ---"
+          grep -n "initHttp" lib/application/application.dart | head -10
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Resolve packages
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      # 与宿主构建用的是同一个目录，里面的 managed SDK / pub-cache 已按同一套规则改名
+      - name: Restore flutter_patcher environment
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.flutter_patcher
+          key: fp-env-${{ runner.os }}-3.47.9-v3
+          restore-keys: |
+            fp-env-${{ runner.os }}-3.47.9-
+
+      - name: Restore baseline (local file store)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT: ${{ inputs.project_path }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/baseline"
+          for attempt in 1 2 3; do
+            if gh release download ios-patcher-latest -R "$GITHUB_REPOSITORY" \
+                 -p "ios-baseline-$VERSION_CODE.tar.gz" -D "$RUNNER_TEMP/baseline" --clobber; then break; fi
+            echo "baseline 下载失败（$attempt/3），10s 后重试"; sleep 10
+          done
+          mkdir -p "$PROJECT/.flutter_patcher/baselines"
+          tar -xzf "$RUNNER_TEMP/baseline/ios-baseline-$VERSION_CODE.tar.gz" \
+            -C "$PROJECT/.flutter_patcher/baselines"
+          ls -lh "$PROJECT/.flutter_patcher/baselines"
+
+      - name: Normalize named constructors (same workaround as host build)
+        working-directory: ${{ inputs.project_path }}
+        env:
+          MANAGED_SDK: /Users/runner/.flutter_patcher/flutter/3.47.9
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          python3 .github/scripts/normalize_named_ctors.py \
+            --project "${{ inputs.project_path }}" \
+            --sdk "$MANAGED_SDK" \
+            --pub-cache "$HOME/.flutter_patcher/pub-cache"
+
+      - name: Generate patch (.fptc)
+        env:
+          PROJECT: ${{ inputs.project_path }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          PATCH_ID: ${{ inputs.patch_id }}
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/patch-out/$PATCH_ID"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          cd "$PROJECT"
+          set +e
+          dart run flutter_patcher patch ios \
+            --version-code "$VERSION_CODE" \
+            --out "$OUT" \
+            2> "$RUNNER_TEMP/patch.err" | tee "$RUNNER_TEMP/patch.json"
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ -s "$RUNNER_TEMP/patch.err" ]; then
+            echo "----- patch stderr 全量 -----"
+            fold -w 300 "$RUNNER_TEMP/patch.err" || true
+          fi
+          if [ "$code" -ne 0 ]; then
+            echo "::error::flutter_patcher patch 失败 (exit=$code)"
+            for d in "$HOME"/.flutter_patcher/builds/*; do
+              [ -d "$d" ] || continue
+              echo "== $d =="
+              find "$d" -maxdepth 2 -type f | head -30
+              for f in "$d"/*.log "$d"/failure.json; do
+                [ -f "$f" ] || continue
+                echo "--- ${f##*/} ---"
+                tail -120 "$f"
+              done
+            done
+            exit "$code"
+          fi
+          echo "=== patch.json ==="
+          cat "$RUNNER_TEMP/patch.json"
+          echo "=== 产物 ==="
+          find "$OUT" -maxdepth 2 -type f -exec ls -lh {} \;
+          F=$(find "$OUT" -name '*.fptc' | head -1)
+          [ -n "$F" ] || { echo "::error::未产出 .fptc"; exit 1; }
+          cp "$F" "$GITHUB_WORKSPACE/patch-out/patch.fptc"
+          sha256sum "$GITHUB_WORKSPACE/patch-out/patch.fptc" || shasum -a 256 "$GITHUB_WORKSPACE/patch-out/patch.fptc"
+          echo "FPTC=$GITHUB_WORKSPACE/patch-out/patch.fptc" >> "$GITHUB_ENV"
+
+      - name: Upload patch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-patch-${{ inputs.patch_id }}
+          path: patch-out/patch.fptc
+          if-no-files-found: error
+
+      - name: Attach patch to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PATCH_ID: ${{ inputs.patch_id }}
+        run: |
+          set -euo pipefail
+          TAG=ios-patches
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              --title "iOS patches" --notes "flutter_patcher iOS 增量补丁（.fptc）"
+          # 标准文件名给设备/补丁服务用；带 patch_id 的副本留档
+          cp "$FPTC" "$RUNNER_TEMP/11-ios-arm64.fptc" || true
+          gh release upload "$TAG" "$RUNNER_TEMP/11-ios-arm64.fptc" -R "$GITHUB_REPOSITORY" --clobber
+          cp "$FPTC" "$RUNNER_TEMP/$PATCH_ID.fptc"
+          gh release upload "$TAG" "$RUNNER_TEMP/$PATCH_ID.fptc" -R "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
