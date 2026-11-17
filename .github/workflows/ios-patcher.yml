@@ -1,0 +1,324 @@
+name: iOS Patcher Host Build
+
+# 用 flutter_patcher 构建「支持热更新」的 zmoanew Ad Hoc IPA（patcher 宿主）。
+# 与 ios-adhoc.yml 的区别：那个用标准 flutter build ios（不含 host policy，不支持热更新）；
+# 这个用 `dart run flutter_patcher build ios`，会注入 patched engine + 在 Info.plist 写
+# FlutterPatcherHostTrust，产出的 IPA 能加载后续下发的 .fptc 补丁。
+# 源码来自 src-cache release 的 src-zmoanew.tar.gz；签名材料来自 3 个 IOS_*_AD_HOC secrets。
+# 注意：build ios 只在 macos-arm64 验证过，故必须用 Apple Silicon runner。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: '构建标识（用于 IPA 文件名）'
+        required: false
+        default: 'adhoc'
+        type: string
+      source_tag:
+        description: '源码快照 release tag'
+        required: false
+        default: 'src-cache'
+        type: string
+      source_asset:
+        description: '源码快照文件名'
+        required: false
+        default: 'src-zmoanew.tar.gz'
+        type: string
+      project_path:
+        description: '工程绝对路径（快照解包后）'
+        required: false
+        default: '/Users/zcj/D/work_zbcx/Flutter/code/oa/code/zmoanew'
+        type: string
+      version_code:
+        description: '宿主 build number（非零整数，须与 pubspec +11 一致）'
+        required: false
+        default: '11'
+        type: string
+      bundle_id:
+        description: '目标 Bundle ID（须与签名 profile 一致）'
+        required: false
+        default: 'com.zerogis.zmoa'
+        type: string
+
+permissions:
+  contents: write   # 上传 IPA 到 release
+
+concurrency:
+  group: ios-patcher
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # 快照保留 /Users/zcj/D/... 绝对路径。macOS runner 的 home 是 /Users/runner，
+      # 故需 sudo 建目录并以 root 解包，再把属主改回 runner，Flutter/CocoaPods 才能写。
+      - name: Restore source snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_TAG: ${{ inputs.source_tag }}
+          SRC_ASSET: ${{ inputs.source_asset }}
+          PROJECT: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users
+          mkdir -p "$RUNNER_TEMP/src"
+          gh release download "$SRC_TAG" -R "$GITHUB_REPOSITORY" \
+            -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber
+          sudo tar -xzf "$RUNNER_TEMP/src/$SRC_ASSET" -C /
+          # 把工程及所有 path 依赖的属主改成 runner
+          sudo chown -R "$(id -u):$(id -g)" /Users/zcj
+          test -f "$PROJECT/pubspec.yaml"
+          echo "源码已恢复到 $PROJECT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Install CocoaPods deps
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set -e
+          # 快照里的 Generated.xcconfig / .flutter-plugins 带的是开发机旧 FLUTTER_ROOT，
+          # 必须删掉让 flutter pub get 用当前 SDK 重新生成，否则 Podfile 里 flutter_root 读错路径。
+          rm -f ios/Flutter/Generated.xcconfig ios/Flutter/flutter_export_environment.sh
+          rm -f .flutter-plugins .flutter-plugins-dependencies
+          flutter pub get
+          grep FLUTTER_ROOT ios/Flutter/Generated.xcconfig
+          # pub get 升级了依赖，新插件要求更高的 iOS deployment target。
+          # 只在 runner 副本上把 12/13 提到 16（不动本地源码）。
+          python3 - <<'PY'
+          import re
+          p = "ios/Podfile"
+          s = open(p).read()
+          s = re.sub(r"platform :ios, '[\d.]+'", "platform :ios, '16.0'", s)
+          # amap_flutter_location 3.0.0 的 podspec 未锁 AMapLocation 版本，
+          # 最新版 2.12.2 移除了 setReGeocodeLanguage API 导致编译失败。
+          # 锁定到本地已验证可编译的 2.11.0（复现本地 Podfile.lock）。
+          if "pod 'AMapLocation'" not in s:
+              s = s.replace(
+                  "  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))",
+                  "  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))\n"
+                  "  pod 'AMapLocation', '2.11.0'\n"
+                  "  pod 'AMapFoundation', '1.8.2'")
+          open(p, "w").write(s)
+          p = "ios/Runner.xcodeproj/project.pbxproj"
+          s = open(p).read()
+          s = re.sub(r"IPHONEOS_DEPLOYMENT_TARGET = [\d.]+;",
+                     "IPHONEOS_DEPLOYMENT_TARGET = 16.0;", s)
+          open(p, "w").write(s)
+          print("deployment target -> 16.0; AMapLocation pinned to 2.11.0")
+          PY
+          cd ios
+          # 高德 SDK 从 a.amap.com 下载，偶发 Connection reset；重试 3 次。
+          for attempt in 1 2 3; do
+            echo "=== pod install 尝试 $attempt/3 ==="
+            if pod install --repo-update; then
+              echo "✅ pod install 成功"
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "❌ pod install 连续 3 次失败"
+              exit 1
+            fi
+            echo "⚠️ pod install 失败，10 秒后重试（清掉半成品 Pods）..."
+            rm -rf Pods Podfile.lock
+            sleep 10
+          done
+
+      # ---- 安装签名材料 ----
+      - name: Install certificate and provisioning profile
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE_AD_HOC }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD_AD_HOC }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE_AD_HOC }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*" >&2; exit 1; }
+
+          [ -n "${IOS_CERTIFICATE:-}" ] || fail "secret IOS_CERTIFICATE_AD_HOC 未配置"
+          [ -n "${IOS_PROVISIONING_PROFILE:-}" ] || fail "secret IOS_PROVISIONING_PROFILE_AD_HOC 未配置"
+
+          # 解 profile，读出 team / profile 名 / bundle id / 类型
+          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          echo "$IOS_PROVISIONING_PROFILE" | base64 --decode > "$PROFILE_PATH"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_UUID=$(plutil -extract UUID raw -o - "$PROFILE_PLIST")
+          TEAM_ID=$(plutil -extract TeamIdentifier.0 raw -o - "$PROFILE_PLIST")
+          PROFILE_NAME=$(plutil -extract Name raw -o - "$PROFILE_PLIST")
+          APP_ID=$(plutil -extract Entitlements.application-identifier raw -o - "$PROFILE_PLIST")
+          BUNDLE_ID=${APP_ID#"$TEAM_ID".}
+          # 校验确实是 ad-hoc profile（有 ProvisionedDevices 且 get-task-allow=false）
+          plutil -extract ProvisionedDevices raw -o /dev/null "$PROFILE_PLIST" \
+            || fail "该 profile 不含设备列表，不是 Ad Hoc 类型"
+          GTA=$(plutil -extract Entitlements.get-task-allow raw -o - "$PROFILE_PLIST" 2>/dev/null || echo false)
+          [ "$GTA" != "true" ] || fail "该 profile 是 Development 类型（get-task-allow=true），不是 Ad Hoc"
+
+          # 建临时 keychain 并导入 p12
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$IOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "${IOS_CERTIFICATE_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          # 确认有 Apple Distribution 签名身份
+          IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")
+          echo "$IDENTITIES"
+          echo "$IDENTITIES" | grep -q "Apple Distribution" \
+            || fail "p12 中没有 Apple Distribution 签名身份"
+
+          # 安装 profile 到系统目录
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+
+          # 传给后续步骤
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+          echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "CODE_SIGN_IDENTITY=Apple Distribution" >> "$GITHUB_ENV"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+
+          echo "team=$TEAM_ID profile=$PROFILE_NAME bundle=$BUNDLE_ID"
+
+      - name: Prepare project for patcher host build
+        working-directory: ${{ inputs.project_path }}
+        env:
+          TARGET_BUNDLE: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          # patcher 做 SPM 文本解析，pbxproj 必须保持原始 OpenStep 格式——
+          # 所以这里用纯文本正则替换，绝不 plutil 转 XML（那是普通 workflow 的做法，
+          # 且只在 flutter build 之后做；这里在 build 之前，转了会破坏 SPM）。
+          python3 - "$TARGET_BUNDLE" <<'PY'
+          import os, re, sys
+          bundle = sys.argv[1]
+          team = os.environ["TEAM_ID"]
+          profile = os.environ["PROFILE_NAME"]
+          pbx = "ios/Runner.xcodeproj/project.pbxproj"
+          s = open(pbx).read()
+          # 替换所有 PRODUCT_BUNDLE_IDENTIFIER 的值（含 [sdk=...] 变体只改主值）
+          s, n = re.subn(r'(PRODUCT_BUNDLE_IDENTIFIER\s*=\s*)[^;]+;',
+                         lambda m: m.group(1) + bundle + ';', s)
+          print(f"PRODUCT_BUNDLE_IDENTIFIER -> {bundle} ({n} 处)")
+
+          # flutter build ipa 需要工程里是手动签名（CI 机器 xcodebuild 不会自己挑 team）。
+          # 用文本方式在 Runner 的 Release buildSettings 里注入签名键（保持 OpenStep 格式）。
+          # 手工签名键写成不带 [sdk=*] 后缀；通过定位 Runner target 的 buildConfiguration。
+          # 简化做法：全局把 CODE_SIGN_STYLE 设为 Manual，并在每个 buildSettings 块补 team/profile。
+          s = re.sub(r'CODE_SIGN_STYLE\s*=\s*Auto;', 'CODE_SIGN_STYLE = Manual;', s)
+          if 'CODE_SIGN_STYLE = Manual;' not in s:
+              # 没有任何 CODE_SIGN_STYLE 就插到每个 PROVISIONING 附近；兜底插到 buildSettings
+              s = s.replace('buildSettings = {', 'buildSettings = {\n\t\t\t\tCODE_SIGN_STYLE = Manual;')
+          # 每个 buildSettings 块补 DEVELOPMENT_TEAM / PROVISIONING_PROFILE_SPECIFIER / CODE_SIGN_IDENTITY
+          def add_signing(m):
+              block = m.group(0)
+              if 'DEVELOPMENT_TEAM' in block and 'PROVISIONING_PROFILE_SPECIFIER' in block:
+                  return block
+              inject = (f'\n\t\t\t\tDEVELOPMENT_TEAM = {team};'
+                        f'\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "{profile}";'
+                        f'\n\t\t\t\tCODE_SIGN_IDENTITY = "Apple Distribution";')
+              return block.replace('buildSettings = {', 'buildSettings = {' + inject, 1)
+          s = re.sub(r'buildSettings = \{.*?\n\t\t\t\};', add_signing, s, flags=re.S)
+          open(pbx, "w").write(s)
+          print(f"签名设置已注入 (team={team}, profile={profile})")
+          PY
+          echo "=== 注入结果抽查 ===" && grep -c "CODE_SIGN_STYLE = Manual" ios/Runner.xcodeproj/project.pbxproj && grep -m1 "PROVISIONING_PROFILE_SPECIFIER" ios/Runner.xcodeproj/project.pbxproj
+
+      - name: Build patcher host IPA (hot-update capable)
+        working-directory: ${{ inputs.project_path }}
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          echo "=== flutter_patcher 版本 ==="
+          dart run flutter_patcher --version 2>&1 | head -3 || true
+
+          # patcher 自己下载 patched engine / 写 host policy / 调 flutter build ipa
+          # --export-method ad-hoc：走 iOS 手动签名（keychain 里已有 p12 identity）
+          # --application-id：显式给 bundle id（避免 patcher 从工程读出多个/错误值）
+          # --version-code：宿主 build number，必须非零整数，与补丁严格对应
+          # --out：产物目录（必须是全新不存在的路径）
+          OUT="$GITHUB_WORKSPACE/patcher-out/$BUILD_ID"
+          rm -rf "$OUT"
+          mkdir -p "$(dirname "$OUT")"
+          set +e
+          dart run flutter_patcher build ios \
+            --application-id "$BUNDLE_ID" \
+            --version-code "$VERSION_CODE" \
+            --export-method ad-hoc \
+            --out "$OUT" \
+            2> "$RUNNER_TEMP/patcher.err" | tee "$RUNNER_TEMP/patcher.json"
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ -s "$RUNNER_TEMP/patcher.err" ]; then
+            echo "----- patcher stderr tail -----"
+            fold -w 300 "$RUNNER_TEMP/patcher.err" | tail -50
+          fi
+          [ "$code" -eq 0 ] || { echo "::error::patcher build 失败 (exit=$code)"; exit "$code"; }
+
+          echo "=== patcher build.json ==="
+          cat "$RUNNER_TEMP/patcher.json"
+          IPA=$(find "$OUT" -name '*.ipa' | head -1)
+          [ -n "$IPA" ] || { echo "::error::patcher 未产出 IPA"; find "$OUT" -type f | head -30; exit 1; }
+          cp "$IPA" "build/${BUILD_ID}.ipa"
+          echo "✅ IPA: build/${BUILD_ID}.ipa"
+          ls -lh "build/${BUILD_ID}.ipa"
+
+          # 校验 host trust 注入成功（patcher 会写 FlutterPatcherHostTrust 到 Info.plist）
+          rm -rf /tmp/ipa_check && mkdir -p /tmp/ipa_check
+          unzip -q "build/${BUILD_ID}.ipa" -d /tmp/ipa_check
+          plutil -extract FlutterPatcherHostTrust raw -o - \
+            /tmp/ipa_check/Payload/Runner.app/Info.plist | head -c 200
+          echo ""
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-patcher
+          path: ${{ inputs.project_path }}/build/${{ inputs.build_id }}.ipa
+          retention-days: 14
+
+      - name: Attach IPA to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_ID: ${{ inputs.build_id }}
+          PROJECT: ${{ inputs.project_path }}
+        run: |
+          set -e
+          IPA="$PROJECT/build/${BUILD_ID}.ipa"
+          gh release upload ios-patcher-latest \
+            "$IPA#zmoa-patcher-${BUILD_ID}.ipa" \
+            -R "$GITHUB_REPOSITORY" --clobber 2>/dev/null || {
+            echo "release 不存在，创建中..."
+            gh release create ios-patcher-latest \
+              "$IPA#zmoa-patcher-${BUILD_ID}.ipa" \
+              -R "$GITHUB_REPOSITORY" --title "iOS Patcher Host IPA (hot-update)" --notes "支持热更新的 patcher 宿主包"
+          }
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ] && \
+            security delete-keychain "$KEYCHAIN_PATH" || true
