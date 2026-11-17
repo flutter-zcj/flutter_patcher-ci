@@ -206,10 +206,12 @@ jobs:
       # 且 patcher 做 SPM 文本解析，pbxproj 只能文本注入（不能 plutil 转 XML）。
       - name: Inject manual signing into pbxproj
         working-directory: ${{ inputs.project_path }}
+        env:
+          VERSION_CODE: ${{ inputs.version_code }}
         run: |
           set -euo pipefail
           python3 "$GITHUB_WORKSPACE/.github/scripts/prepare_ios_signing.py" \
-            "$BUNDLE_ID" "$TEAM_ID" "$PROFILE_NAME" "$PWD"
+            "$BUNDLE_ID" "$TEAM_ID" "$PROFILE_NAME" "$PWD" "$VERSION_CODE"
 
       # patcher 调 `flutter build ipa --export-method ad-hoc` 时不接受 --export-options-plist，
       # 而 flutter 自动生成的 ExportOptions 里没有 provisioningProfiles，
@@ -353,6 +355,9 @@ jobs:
           echo "=== 导出结果 ==="
           ls -la build/ios/ipa 2>/dev/null || echo "(无 build/ios/ipa)"
           find build/ios -maxdepth 2 -name '*.ipa' 2>/dev/null
+          echo "=== archive 内 Info.plist 关键值（patcher 校验用）==="
+          plutil -p build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app/Info.plist 2>/dev/null \
+            | grep -E "CFBundleVersion|CFBundleIdentifier|CFBundleShortVersionString|FlutterPatcherHostTrust" || true
           rm -rf build/ios
           exit 0
 
@@ -396,11 +401,14 @@ jobs:
               [ -d "$d" ] || continue
               echo "== $d =="
               find "$d" -maxdepth 2 -type f | head -30
-              for f in failure.json log.txt build.log steps.json; do
-                if [ -f "$d/$f" ]; then
-                  echo "--- $f ---"
-                  tail -120 "$d/$f"
-                fi
+              for f in "$d"/*.log "$d"/failure.json "$d"/steps.json "$d"/baseline/host_policy.json; do
+                [ -f "$f" ] || continue
+                case "$f" in
+                  *9-ipa.log|*8-baseline-kernel.log|*failure.json|*steps.json|*host_policy.json) ;;
+                  *) continue ;;
+                esac
+                echo "--- ${f##*/} ---"
+                tail -120 "$f"
               done
             done
             exit "$code"
