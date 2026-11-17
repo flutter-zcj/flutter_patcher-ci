@@ -340,7 +340,10 @@ jobs:
           # iOS 只能 bytecode（不能用 --strategy so），所以直接给 patcher 的 managed SDK 打补丁：
           # 把命名构造函数 .text 改名 .fromText（实例字段 text 保持不变），三处调用点同步改。
           # managed SDK 从 git clone，改本地 SDK 无效，必须在 clone 之后改。
-          SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+          SDK_DIR=""
+          if [ -d "$HOME/.flutter_patcher/flutter" ]; then
+            SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1 || true)
+          fi
           if [ -z "$SDK_DIR" ] || [ ! -d "$SDK_DIR/packages/flutter" ]; then
             echo "=== 预热：让 patcher clone managed SDK（预期失败在 baseline-kernel，忽略）==="
             dart run flutter_patcher build ios \
@@ -348,7 +351,10 @@ jobs:
               --export-method ad-hoc --out "$GITHUB_WORKSPACE/patcher-warm" \
               > /dev/null 2>&1 || true
             rm -rf "$HOME"/.flutter_patcher/builds/run.pending-* "$GITHUB_WORKSPACE/patcher-warm"
-            SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+            SDK_DIR=""
+            if [ -d "$HOME/.flutter_patcher/flutter" ]; then
+              SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1 || true)
+            fi
           fi
           [ -n "$SDK_DIR" ] && [ -d "$SDK_DIR/packages/flutter" ] || { echo "::error::managed SDK 未就绪"; exit 1; }
           echo "managed SDK: $SDK_DIR"
