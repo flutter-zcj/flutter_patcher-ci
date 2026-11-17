@@ -1,11 +1,18 @@
 name: iOS Patcher Host Build
 
 # 用 flutter_patcher 构建「支持热更新」的 zmoanew Ad Hoc IPA（patcher 宿主）。
-# 与 ios-adhoc.yml 的区别：那个用标准 flutter build ios（不含 host policy，不支持热更新）；
-# 这个用 `dart run flutter_patcher build ios`，会注入 patched engine + 在 Info.plist 写
-# FlutterPatcherHostTrust，产出的 IPA 能加载后续下发的 .fptc 补丁。
-# 源码来自 src-cache release 的 src-zmoanew.tar.gz；签名材料来自 3 个 IOS_*_AD_HOC secrets。
-# 注意：build ios 只在 macos-arm64 验证过，故必须用 Apple Silicon runner。
+#
+# 与 ios-adhoc.yml 的区别：那个用标准 `flutter build ios`，原生侧没有 host policy，
+# 热更新完全空转；这个用 `dart run flutter_patcher build ios`，会注入 patched engine
+# 并在 Info.plist 写入 FlutterPatcherHostTrust，产出的 IPA 才能加载 .fptc 补丁。
+#
+# 关键约束：
+#   1. build ios 只支持 Apple Silicon（macos-15 runner 是 arm64）；
+#   2. 签名必须在 build 之前写进 pbxproj（patcher 内部走 `flutter build ipa`）；
+#   3. patcher 1.1.1 上游 bug（issue #14）：命名构造函数与实例成员同名会被
+#      extract-surface 误判，baseline-kernel 阶段报 Expected instance member。
+#      iOS 只能走 bytecode（无 --strategy so），故用 .github/scripts/normalize_named_ctors.py
+#      在 runner 副本上统一改名绕过（不动用户本地源码）。
 
 on:
   workflow_dispatch:
@@ -13,7 +20,7 @@ on:
       build_id:
         description: '构建标识（用于 IPA 文件名）'
         required: false
-        default: 'adhoc'
+        default: 'patcher-v4.2.2'
         type: string
       source_tag:
         description: '源码快照 release tag'
@@ -31,7 +38,7 @@ on:
         default: '/Users/zcj/D/work_zbcx/Flutter/code/oa/code/zmoanew'
         type: string
       version_code:
-        description: '宿主 build number（非零整数，须与 pubspec +11 一致）'
+        description: '宿主 build number（非零整数，须与 pubspec +N 一致）'
         required: false
         default: '11'
         type: string
@@ -42,7 +49,7 @@ on:
         type: string
 
 permissions:
-  contents: write   # 上传 IPA 到 release
+  contents: write   # 上传 IPA / 基线到 release
 
 concurrency:
   group: ios-patcher
@@ -51,7 +58,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -73,10 +80,12 @@ jobs:
           set -euo pipefail
           sudo mkdir -p /Users
           mkdir -p "$RUNNER_TEMP/src"
-          gh release download "$SRC_TAG" -R "$GITHUB_REPOSITORY" \
-            -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber
+          for attempt in 1 2 3; do
+            if gh release download "$SRC_TAG" -R "$GITHUB_REPOSITORY" \
+                 -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber; then break; fi
+            echo "下载失败（$attempt/3），10s 后重试"; sleep 10
+          done
           sudo tar -xzf "$RUNNER_TEMP/src/$SRC_ASSET" -C /
-          # 把工程及所有 path 依赖的属主改成 runner
           sudo chown -R "$(id -u):$(id -g)" /Users/zcj
           test -f "$PROJECT/pubspec.yaml"
           echo "源码已恢复到 $PROJECT"
@@ -93,7 +102,7 @@ jobs:
         run: |
           set -e
           # 快照里的 Generated.xcconfig / .flutter-plugins 带的是开发机旧 FLUTTER_ROOT，
-          # 必须删掉让 flutter pub get 用当前 SDK 重新生成，否则 Podfile 里 flutter_root 读错路径。
+          # 必须删掉让 pub get 用当前 SDK 重新生成，否则 Podfile 里 flutter_root 读错路径。
           rm -f ios/Flutter/Generated.xcconfig ios/Flutter/flutter_export_environment.sh
           rm -f .flutter-plugins .flutter-plugins-dependencies
           flutter pub get
@@ -106,8 +115,7 @@ jobs:
           s = open(p).read()
           s = re.sub(r"platform :ios, '[\d.]+'", "platform :ios, '16.0'", s)
           # amap_flutter_location 3.0.0 的 podspec 未锁 AMapLocation 版本，
-          # 最新版 2.12.2 移除了 setReGeocodeLanguage API 导致编译失败。
-          # 锁定到本地已验证可编译的 2.11.0（复现本地 Podfile.lock）。
+          # 最新版移除了 setReGeocodeLanguage API 会导致编译失败，锁到本地验证过的 2.11.0。
           if "pod 'AMapLocation'" not in s:
               s = s.replace(
                   "  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))",
@@ -152,7 +160,6 @@ jobs:
           [ -n "${IOS_CERTIFICATE:-}" ] || fail "secret IOS_CERTIFICATE_AD_HOC 未配置"
           [ -n "${IOS_PROVISIONING_PROFILE:-}" ] || fail "secret IOS_PROVISIONING_PROFILE_AD_HOC 未配置"
 
-          # 解 profile，读出 team / profile 名 / bundle id / 类型
           PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
           echo "$IOS_PROVISIONING_PROFILE" | base64 --decode > "$PROFILE_PATH"
           PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
@@ -162,13 +169,11 @@ jobs:
           PROFILE_NAME=$(plutil -extract Name raw -o - "$PROFILE_PLIST")
           APP_ID=$(plutil -extract Entitlements.application-identifier raw -o - "$PROFILE_PLIST")
           BUNDLE_ID=${APP_ID#"$TEAM_ID".}
-          # 校验确实是 ad-hoc profile（有 ProvisionedDevices 且 get-task-allow=false）
           plutil -extract ProvisionedDevices raw -o /dev/null "$PROFILE_PLIST" \
             || fail "该 profile 不含设备列表，不是 Ad Hoc 类型"
           GTA=$(plutil -extract Entitlements.get-task-allow raw -o - "$PROFILE_PLIST" 2>/dev/null || echo false)
           [ "$GTA" != "true" ] || fail "该 profile 是 Development 类型（get-task-allow=true），不是 Ad Hoc"
 
-          # 建临时 keychain 并导入 p12
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
@@ -180,143 +185,67 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
-          # 确认有 Apple Distribution 签名身份
           IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")
           echo "$IDENTITIES"
           echo "$IDENTITIES" | grep -q "Apple Distribution" \
             || fail "p12 中没有 Apple Distribution 签名身份"
 
-          # 安装 profile 到系统目录
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 
-          # 传给后续步骤
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
           echo "TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
           echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
           echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
-          echo "CODE_SIGN_IDENTITY=Apple Distribution" >> "$GITHUB_ENV"
           echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
 
           echo "team=$TEAM_ID profile=$PROFILE_NAME bundle=$BUNDLE_ID"
 
-      - name: Prepare project for patcher host build
+      # patcher build ios 内部走 `flutter build ipa`，签名必须在 build 之前进工程；
+      # 且 patcher 做 SPM 文本解析，pbxproj 只能文本注入（不能 plutil 转 XML）。
+      - name: Inject manual signing into pbxproj
         working-directory: ${{ inputs.project_path }}
-        env:
-          TARGET_BUNDLE: ${{ inputs.bundle_id }}
         run: |
           set -euo pipefail
-          # patcher 做 SPM 文本解析，pbxproj 必须保持原始 OpenStep 格式——
-          # 所以这里用纯文本正则替换，绝不 plutil 转 XML（那是普通 workflow 的做法，
-          # 且只在 flutter build 之后做；这里在 build 之前，转了会破坏 SPM）。
-          python3 - "$TARGET_BUNDLE" <<'PY'
-          import os, re, sys
-          bundle = sys.argv[1]
-          team = os.environ["TEAM_ID"]
-          profile = os.environ["PROFILE_NAME"]
-          pbx = "ios/Runner.xcodeproj/project.pbxproj"
-          s = open(pbx).read()
-          # 替换所有 PRODUCT_BUNDLE_IDENTIFIER 的值（含 [sdk=...] 变体只改主值）
-          s, n = re.subn(r'(PRODUCT_BUNDLE_IDENTIFIER\s*=\s*)[^;]+;',
-                         lambda m: m.group(1) + bundle + ';', s)
-          print(f"PRODUCT_BUNDLE_IDENTIFIER -> {bundle} ({n} 处)")
+          python3 "$GITHUB_WORKSPACE/.github/scripts/prepare_ios_signing.py" \
+            "$BUNDLE_ID" "$TEAM_ID" "$PROFILE_NAME" "$PWD"
 
-          # flutter build ipa 需要工程里是手动签名（CI 机器 xcodebuild 不会自己挑 team）。
-          # 用文本方式在 Runner 的 Release buildSettings 里注入签名键（保持 OpenStep 格式）。
-          # 手工签名键写成不带 [sdk=*] 后缀；通过定位 Runner target 的 buildConfiguration。
-          # 简化做法：全局把 CODE_SIGN_STYLE 设为 Manual，并在每个 buildSettings 块补 team/profile。
-          s = re.sub(r'CODE_SIGN_STYLE\s*=\s*Auto;', 'CODE_SIGN_STYLE = Manual;', s)
-          if 'CODE_SIGN_STYLE = Manual;' not in s:
-              # 没有任何 CODE_SIGN_STYLE 就插到每个 PROVISIONING 附近；兜底插到 buildSettings
-              s = s.replace('buildSettings = {', 'buildSettings = {\n\t\t\t\tCODE_SIGN_STYLE = Manual;')
-          # 每个 buildSettings 块补 DEVELOPMENT_TEAM / PROVISIONING_PROFILE_SPECIFIER / CODE_SIGN_IDENTITY
-          def add_signing(m):
-              block = m.group(0)
-              if 'DEVELOPMENT_TEAM' in block and 'PROVISIONING_PROFILE_SPECIFIER' in block:
-                  return block
-              inject = (f'\n\t\t\t\tDEVELOPMENT_TEAM = {team};'
-                        f'\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "{profile}";'
-                        f'\n\t\t\t\tCODE_SIGN_IDENTITY = "Apple Distribution";')
-              return block.replace('buildSettings = {', 'buildSettings = {' + inject, 1)
-          s = re.sub(r'buildSettings = \{.*?\n\t\t\t\};', add_signing, s, flags=re.S)
-          open(pbx, "w").write(s)
-          print(f"签名设置已注入 (team={team}, profile={profile})")
-          PY
-          echo "=== 注入结果抽查 ===" && grep -c "CODE_SIGN_STYLE = Manual" ios/Runner.xcodeproj/project.pbxproj && grep -m1 "PROVISIONING_PROFILE_SPECIFIER" ios/Runner.xcodeproj/project.pbxproj
+      # ---- 绕过 flutter_patcher 上游 bug（issue #14）----
+      # extract-surface 把「命名构造函数与同类实例成员同名」的声明当成实例成员，
+      # baseline-kernel 校验时报 `Expected instance member <Class>.<ctor>`。
+      # iOS 只能 bytecode 策略，没有 --strategy so 的退路，故直接改名绕过：
+      # 在 runner 的 managed SDK + pub-cache + 工程副本上把 ctor 名改为 from<Ctor>，
+      # 并同步改写所有调用点（不动用户本地源码）。
+      - name: Warm managed SDK
+        working-directory: ${{ inputs.project_path }}
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/patcher-warm"
+          # 首次会 clone managed Flutter SDK；本工程在 baseline-kernel 阶段失败是预期的
+          # （那里正是要修的上游 bug），这里只取 SDK。
+          dart run flutter_patcher build ios \
+            --application-id "$BUNDLE_ID" --version-code "$VERSION_CODE" \
+            --export-method ad-hoc --out "$GITHUB_WORKSPACE/patcher-warm" \
+            > /dev/null 2>&1 || true
+          rm -rf "$HOME"/.flutter_patcher/builds/run.pending-* "$GITHUB_WORKSPACE/patcher-warm"
+          SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1 || true)
+          [ -n "$SDK_DIR" ] && [ -d "$SDK_DIR/packages/flutter" ] \
+            || { echo "::error::managed SDK 未就绪（$HOME/.flutter_patcher/flutter）"; exit 1; }
+          echo "MANAGED_SDK=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "managed SDK: $SDK_DIR"
 
-          # ---- 绕过 flutter_patcher 上游 bug（issue #14）----
-          # extract-surface 把 CupertinoDesktopTextSelectionToolbarButton 的命名构造函数 .text
-          # 误判成实例成员，只要 App import package:flutter/cupertino.dart 就必现：
-          #   BUILD_STEP_FAILED: baseline-kernel failed: Expected instance member ...text
-          # Android 能用 --strategy so 绕过，iOS 只能 bytecode，没这条路。
-          # 本工程里引用 cupertino 的文件全是死 import（未使用任何 Cupertino 符号），
-          # 移除后 extract-surface 不再扫描 cupertino 库，即可绕过。
-          python3 - <<'PY'
-          import json, os, re, subprocess
-          # 覆盖主工程 + 全部 path 依赖：读 package_config 拿到每个包的 rootUri
-          pkg_cfg = json.load(open(".dart_tool/package_config.json"))
-          flutter_root = os.environ.get("FLUTTER_ROOT", "").rstrip("/")
-          roots = set()
-          for pkg in pkg_cfg.get("packages", []):
-              uri = pkg.get("rootUri", "")
-              if uri.startswith("file://"):
-                  path = uri[len("file://"):]
-              elif uri.startswith("../") or uri.startswith("./"):
-                  path = os.path.normpath(os.path.join(".dart_tool", uri))
-              else:
-                  continue
-              if not path.startswith("/"):
-                  continue
-              # 跳过 pub cache 里的 hosted 包
-              if "/.pub-cache/" in path:
-                  continue
-              # 关键：绝不碰 Flutter SDK 自身（否则会破坏 framework）
-              if flutter_root and (path == flutter_root or path.startswith(flutter_root + "/")):
-                  print(f"  跳过 Flutter SDK: {path}")
-                  continue
-              roots.add(path)
-          pat = re.compile(r"^\s*import\s+['\"]package:flutter/cupertino\.dart['\"]\s*;\s*\n", re.M)
-          mat_pat = re.compile(r"import\s+['\"]package:flutter/material\.dart['\"]")
-          removed = 0
-          for root in sorted(roots):
-              lib = os.path.join(root, "lib")
-              if not os.path.isdir(lib):
-                  continue
-              for dirpath, _, files in os.walk(lib):
-                  for name in files:
-                      if not name.endswith(".dart"):
-                          continue
-                      path = os.path.join(dirpath, name)
-                      try:
-                          src = open(path, encoding="utf-8").read()
-                      except Exception:
-                          continue
-                      if not pat.search(src):
-                          continue
-                      # 文件里有活的 Cupertino 符号就保留（改不动）
-                      if re.search(r"\bCupertino[A-Za-z]+\b|\bshowCupertino[A-Za-z]+\b", src):
-                          print(f"  保留（有实际 Cupertino 用法）: {os.path.relpath(path, '/')}")
-                          continue
-                      # 关键：若文件已 import material，直接删 cupertino 行；
-                      # 否则把它替换成 material（否则 Widget/Color 等基础类型全部未定义）。
-                      if mat_pat.search(src):
-                          new = pat.sub("", src)
-                          action = "删除"
-                      else:
-                          new = pat.sub("import 'package:flutter/material.dart';\n", src, count=1)
-                          action = "替换为 material"
-                      if new != src:
-                          open(path, "w", encoding="utf-8").write(new)
-                          removed += 1
-                          print(f"  {action}: {os.path.relpath(path, '/')}")
-          print(f"共处理 {removed} 处 cupertino import")
-          # 复查：本地路径依赖里是否还有活的 cupertino 引用
-          still = subprocess.run(["bash", "-lc",
-              "grep -rl 'package:flutter/cupertino.dart' " +
-              " ".join(f"'{r}/lib'" for r in roots) + " 2>/dev/null || true"],
-              capture_output=True, text=True).stdout.strip()
-          print("剩余引用 cupertino 的文件:", still or "无")
-          PY
+      - name: Normalize named constructors (upstream bug workaround)
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/normalize_named_ctors.py" \
+            --project "$PWD" --sdk "$MANAGED_SDK" --report "$RUNNER_TEMP/ctors.json"
+          echo "=== 冲突明细（最多 60 行）==="
+          python3 -c "import json;d=json.load(open('$RUNNER_TEMP/ctors.json'));print(len(d['collisions']),'处冲突');[print(' ',c['class']+'.'+c['ctor'],'->',c['new']) for c in d['collisions']]"
 
       - name: Build patcher host IPA (hot-update capable)
         working-directory: ${{ inputs.project_path }}
@@ -329,87 +258,10 @@ jobs:
           echo "=== flutter_patcher 版本 ==="
           dart run flutter_patcher --version 2>&1 | head -3 || true
 
-          # patcher 自己下载 patched engine / 写 host policy / 调 flutter build ipa
-          # --export-method ad-hoc：走 iOS 手动签名（keychain 里已有 p12 identity）
-          # --application-id：显式给 bundle id（避免 patcher 从工程读出多个/错误值）
-          # --version-code：宿主 build number，必须非零整数，与补丁严格对应
-          # ---- 绕过 flutter_patcher 上游 bug（issue #14）----
-          # extract-surface 把 CupertinoDesktopTextSelectionToolbarButton 的命名构造函数 .text
-          # 误判成实例成员，只要 App 用到 Cupertino 组件就必现：
-          #   baseline-kernel failed: Expected instance member ...text
-          # iOS 只能 bytecode（不能用 --strategy so），所以直接给 patcher 的 managed SDK 打补丁：
-          # 把命名构造函数 .text 改名 .fromText（实例字段 text 保持不变），三处调用点同步改。
-          # managed SDK 从 git clone，改本地 SDK 无效，必须在 clone 之后改。
-          SDK_DIR=""
-          if [ -d "$HOME/.flutter_patcher/flutter" ]; then
-            SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1 || true)
-          fi
-          if [ -z "$SDK_DIR" ] || [ ! -d "$SDK_DIR/packages/flutter" ]; then
-            echo "=== 预热：让 patcher clone managed SDK（预期失败在 baseline-kernel，忽略）==="
-            dart run flutter_patcher build ios \
-              --application-id "$BUNDLE_ID" --version-code "$VERSION_CODE" \
-              --export-method ad-hoc --out "$GITHUB_WORKSPACE/patcher-warm" \
-              > /dev/null 2>&1 || true
-            rm -rf "$HOME"/.flutter_patcher/builds/run.pending-* "$GITHUB_WORKSPACE/patcher-warm"
-            SDK_DIR=""
-            if [ -d "$HOME/.flutter_patcher/flutter" ]; then
-              SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1 || true)
-            fi
-          fi
-          [ -n "$SDK_DIR" ] && [ -d "$SDK_DIR/packages/flutter" ] || { echo "::error::managed SDK 未就绪"; exit 1; }
-          echo "managed SDK: $SDK_DIR"
+          # patcher 会解锁/使用 keychain 里的 Apple Distribution 身份签名
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH" || true
 
-          echo "=== patch managed SDK: 自动重命名所有 .text 命名构造函数 ==="
-          python3 - "$SDK_DIR" <<'PY'
-          import os, re, sys
-          sdk = sys.argv[1]
-          lib = os.path.join(sdk, "packages", "flutter", "lib")
-          if not os.path.isdir(lib):
-              sys.exit(f"找不到 framework lib: {lib}")
-
-          # 1) 找出所有「有 ClassName.text({ 命名构造函数 + final String? text; 实例字段」的类。
-          #    extract-surface 会把这种命名构造函数误判成实例成员，导致 baseline-kernel 失败。
-          targets = set()
-          for dirpath, _, files in os.walk(lib):
-              for name in files:
-                  if not name.endswith(".dart"):
-                      continue
-                  try:
-                      s = open(os.path.join(dirpath, name), encoding="utf-8").read()
-                  except Exception:
-                      continue
-                  for m in re.finditer(r"class\s+([A-Z][A-Za-z0-9_]*)\b", s):
-                      cls = m.group(1)
-                      if (re.search(r"\b" + re.escape(cls) + r"\.text\(", s)
-                              and re.search(r"final\s+String\?\s+text\s*;", s)):
-                          targets.add(cls)
-
-          if not targets:
-              sys.exit("未找到需要改名的类：源码结构可能已变，请检查")
-
-          # 2) 全 framework 里把 ClassName.text( 改成 ClassName.fromText(（精确到类名，不碰别的 .text）
-          total = 0
-          for dirpath, _, files in os.walk(lib):
-              for name in files:
-                  if not name.endswith(".dart"):
-                      continue
-                  p = os.path.join(dirpath, name)
-                  try:
-                      s = open(p, encoding="utf-8").read()
-                  except Exception:
-                      continue
-                  orig = s
-                  for cls in targets:
-                      s = s.replace(cls + ".text(", cls + ".fromText(")
-                  if s != orig:
-                      open(p, "w", encoding="utf-8").write(s)
-                      total += 1
-                      print(f"  patch: {os.path.relpath(p, lib)}")
-          print(f"改名类: {sorted(targets)}")
-          print(f"改动文件数: {total}")
-          PY
-
-          # --out：产物目录（必须是全新不存在的路径）
           OUT="$GITHUB_WORKSPACE/patcher-out/$BUILD_ID"
           rm -rf "$OUT"
           mkdir -p "$(dirname "$OUT")"
@@ -424,7 +276,7 @@ jobs:
           set -e
           if [ -s "$RUNNER_TEMP/patcher.err" ]; then
             echo "----- patcher stderr tail -----"
-            fold -w 300 "$RUNNER_TEMP/patcher.err" | tail -50
+            fold -w 300 "$RUNNER_TEMP/patcher.err" | tail -60
           fi
           [ "$code" -eq 0 ] || { echo "::error::patcher build 失败 (exit=$code)"; exit "$code"; }
 
@@ -439,9 +291,28 @@ jobs:
           # 校验 host trust 注入成功（patcher 会写 FlutterPatcherHostTrust 到 Info.plist）
           rm -rf /tmp/ipa_check && mkdir -p /tmp/ipa_check
           unzip -q "build/${BUILD_ID}.ipa" -d /tmp/ipa_check
-          plutil -extract FlutterPatcherHostTrust raw -o - \
-            /tmp/ipa_check/Payload/Runner.app/Info.plist | head -c 200
-          echo ""
+          echo "--- Info.plist 关键字段 ---"
+          for key in CFBundleIdentifier CFBundleShortVersionString CFBundleVersion FlutterPatcherHostTrust; do
+            printf '%s = ' "$key"
+            plutil -extract "$key" raw -o - /tmp/ipa_check/Payload/Runner.app/Info.plist 2>/dev/null | head -c 300 || echo "(缺失)"
+            echo ""
+          done
+          echo "--- 内嵌 engine（应为 patched engine）---"
+          ls -lh /tmp/ipa_check/Payload/Runner.app/Frameworks/Flutter.framework/Flutter
+
+      # 基线是后续生成补丁的唯一依据：丢了对应构建就再也打不了补丁，必须持久化。
+      - name: Pack baseline
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          BASELINE_DIR=".flutter_patcher/baselines"
+          if [ -d "$BASELINE_DIR" ]; then
+            ls -lh "$BASELINE_DIR"
+            tar -czf "$RUNNER_TEMP/ios-baseline-${{ inputs.version_code }}.tar.gz" -C "$BASELINE_DIR" .
+            ls -lh "$RUNNER_TEMP/ios-baseline-${{ inputs.version_code }}.tar.gz"
+          else
+            echo "::warning::未找到基线目录 $BASELINE_DIR"
+          fi
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
@@ -450,22 +321,36 @@ jobs:
           path: ${{ inputs.project_path }}/build/${{ inputs.build_id }}.ipa
           retention-days: 14
 
-      - name: Attach IPA to release
+      - name: Upload baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-baseline
+          path: ${{ runner.temp }}/ios-baseline-${{ inputs.version_code }}.tar.gz
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Attach IPA and baseline to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_ID: ${{ inputs.build_id }}
           PROJECT: ${{ inputs.project_path }}
+          VERSION_CODE: ${{ inputs.version_code }}
         run: |
           set -e
           IPA="$PROJECT/build/${BUILD_ID}.ipa"
-          gh release upload ios-patcher-latest \
-            "$IPA#zmoa-patcher-${BUILD_ID}.ipa" \
-            -R "$GITHUB_REPOSITORY" --clobber 2>/dev/null || {
-            echo "release 不存在，创建中..."
-            gh release create ios-patcher-latest \
-              "$IPA#zmoa-patcher-${BUILD_ID}.ipa" \
-              -R "$GITHUB_REPOSITORY" --title "iOS Patcher Host IPA (hot-update)" --notes "支持热更新的 patcher 宿主包"
-          }
+          BASELINE="$RUNNER_TEMP/ios-baseline-${VERSION_CODE}.tar.gz"
+          ASSETS=("$IPA#zmoa-patcher-${BUILD_ID}.ipa")
+          [ -f "$BASELINE" ] && ASSETS+=("$BASELINE#ios-baseline-${VERSION_CODE}.tar.gz")
+          for attempt in 1 2 3; do
+            if gh release upload ios-patcher-latest "${ASSETS[@]}" -R "$GITHUB_REPOSITORY" --clobber 2>/dev/null; then
+              echo "✅ 已上传到 release ios-patcher-latest"; exit 0
+            fi
+            echo "上传失败（$attempt/3），10s 后重试"; sleep 10
+          done
+          echo "release 不存在或上传失败，创建中..."
+          gh release create ios-patcher-latest "${ASSETS[@]}" \
+            -R "$GITHUB_REPOSITORY" --title "iOS Patcher Host IPA (hot-update)" \
+            --notes "支持热更新的 patcher 宿主包（含基线）"
 
       - name: Cleanup keychain
         if: always()
