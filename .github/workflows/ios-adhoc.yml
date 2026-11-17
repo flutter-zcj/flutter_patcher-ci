@@ -29,6 +29,16 @@ on:
         required: false
         default: '/Users/zcj/D/work_zbcx/Flutter/code/oa/code/zmoanew'
         type: string
+      build_name:
+        description: 'App 版本号（MARKETING_VERSION，如 4.2.2）'
+        required: false
+        default: ''
+        type: string
+      build_number:
+        description: '构建号（CURRENT_PROJECT_VERSION，如 11）'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write   # 上传 IPA 到 release
@@ -177,7 +187,19 @@ jobs:
 
       - name: Build Flutter iOS (no codesign)
         working-directory: ${{ inputs.project_path }}
-        run: flutter build ios --release --no-codesign
+        env:
+          BUILD_NAME: ${{ inputs.build_name }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          set -e
+          # 版本可每次 dispatch 指定；留空则沿用 pubspec.yaml 的值。
+          # CI 用的是 src-cache 快照，本地改 pubspec 不会自动进来，
+          # 所以这里用 --build-name/--build-number 显式覆盖最直接。
+          ARGS=""
+          [ -n "$BUILD_NAME" ]   && ARGS="$ARGS --build-name $BUILD_NAME"
+          [ -n "$BUILD_NUMBER" ] && ARGS="$ARGS --build-number $BUILD_NUMBER"
+          echo "flutter build ios --release --no-codesign$ARGS"
+          flutter build ios --release --no-codesign $ARGS
 
       - name: Archive + export Ad Hoc IPA
         working-directory: ${{ inputs.project_path }}
@@ -201,6 +223,7 @@ jobs:
               ["plutil", "-convert", "json", "-o", "-", pbx]))
           objects = data["objects"]
           settings = {
+              "PRODUCT_BUNDLE_IDENTIFIER": app_id,
               "CODE_SIGN_STYLE": "Manual",
               "DEVELOPMENT_TEAM": os.environ["TEAM_ID"],
               "PROVISIONING_PROFILE_SPECIFIER": os.environ["PROFILE_NAME"],
