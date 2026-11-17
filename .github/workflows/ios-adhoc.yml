@@ -122,7 +122,21 @@ jobs:
           print("deployment target -> 16.0; AMapLocation pinned to 2.11.0")
           PY
           cd ios
-          pod install --repo-update
+          # 高德 SDK 从 a.amap.com 下载，偶发 Connection reset；重试 3 次。
+          for attempt in 1 2 3; do
+            echo "=== pod install 尝试 $attempt/3 ==="
+            if pod install --repo-update; then
+              echo "✅ pod install 成功"
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "❌ pod install 连续 3 次失败"
+              exit 1
+            fi
+            echo "⚠️ pod install 失败，10 秒后重试（清掉半成品 Pods）..."
+            rm -rf Pods Podfile.lock
+            sleep 10
+          done
 
       # ---- 安装签名材料 ----
       - name: Install certificate and provisioning profile
