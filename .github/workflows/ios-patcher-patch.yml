@@ -1,52 +1,46 @@
 name: iOS Patcher Incremental Patch
 
-# 为一个已发布的 patcher 宿主打「增量补丁」（.fptc）。
+# 生成 flutter_patcher 增量补丁（.fptc）
 #
-# 为什么跑在 Linux 上：iOS 补丁只编译 Dart（bytecode 策略），patcher 源码里
-# linux-x64 对 ios 是官方 verified 组合，不需要 Xcode / 证书 / pod。
-# （MACOS runner 额度已用尽，job 起不来，故改用 ubuntu。）
+# 状态：结构按实测结论编写（跨机器会 PATCH_NATIVE_CHANGE），但本文件尚未在 CI
+# 跑通过一轮（当时 GitHub Actions 被账单拦截）。跑之前先确认 runner 额度。
 #
-# 关键：补丁必须与宿主 baseline 完全对齐，所以顺序固定：
-#   1. 恢复源码快照（必须与宿主构建同一份）
-#   2. 应用本次业务改动
-#   3. warm 一次 patcher（准备 managed SDK / pub-cache / tools 工件）
-#   4. pub get 到 patcher 的 pub-cache
-#   5. 跑同一套 ctor 改名（接口名必须与宿主一致）
-#   6. 把 baseline 放回工程 .flutter_patcher/baselines（本地 file store）
-#   7. dart run flutter_patcher patch ios
+# 必须 macos-15：补丁侧的 native_files 哈希要与宿主构建时一致，
+# 只有同一套 Xcode + pod install + SPM 解算能复现。
 
 on:
   workflow_dispatch:
     inputs:
       patch_id:
-        description: '补丁标识（产物目录名 / 留档文件名）'
+        description: '补丁标识'
         required: false
-        default: 'p11-http-init'
+        default: 'p11'
         type: string
       diff_path:
-        description: '本次改动的 patch 文件（相对仓库根目录）'
+        description: '本次改动 diff（相对仓库根目录）'
         required: false
         default: '.github/patches/fix-http-init.diff'
         type: string
       source_tag:
-        description: '源码快照 release tag'
-        required: false
         default: 'src-cache'
         type: string
       source_asset:
-        description: '源码快照文件名'
-        required: false
         default: 'src-zmoanew.tar.gz'
         type: string
       project_path:
-        description: '工程绝对路径（快照解包后，必须与宿主构建时一致）'
-        required: false
         default: '/Users/zcj/D/work_zbcx/Flutter/code/oa/code/zmoanew'
         type: string
       version_code:
-        description: '宿主 build number（必须与宿主一致）'
-        required: false
         default: '11'
+        type: string
+      bundle_id:
+        default: 'com.zerogis.zmoa'
+        type: string
+      profile_name:
+        default: 'Builder AdHoc com.zerogis.zmoa'
+        type: string
+      team_id:
+        default: 'AAMF3H7696'
         type: string
 
 permissions:
@@ -58,10 +52,18 @@ concurrency:
 
 jobs:
   patch:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: macos-15
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app
+          fi
+          xcodebuild -version || true
 
       - name: Restore source snapshot
         env:
@@ -71,17 +73,16 @@ jobs:
           PROJECT: ${{ inputs.project_path }}
         run: |
           set -euo pipefail
-          sudo mkdir -p "$(dirname "$PROJECT")" /Users
+          sudo mkdir -p /Users
           mkdir -p "$RUNNER_TEMP/src"
           for attempt in 1 2 3; do
             if gh release download "$SRC_TAG" -R "$GITHUB_REPOSITORY" \
                  -p "$SRC_ASSET" -D "$RUNNER_TEMP/src" --clobber; then break; fi
-            echo "下载失败（$attempt/3），10s 后重试"; sleep 10
+            echo "下载失败（$attempt/3）"; sleep 10
           done
           sudo tar -xzf "$RUNNER_TEMP/src/$SRC_ASSET" -C /
-          sudo chown -R "$(id -u):$(id -g)" /Users
+          sudo chown -R "$(id -u):$(id -g)" /Users/zcj
           test -f "$PROJECT/pubspec.yaml"
-          echo "源码已恢复到 $PROJECT"
 
       - name: Apply the change under patch
         env:
@@ -90,9 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PROJECT"
-          git apply --check -p1 "$GITHUB_WORKSPACE/$DIFF" 2>/dev/null || true
           patch -p1 --forward -i "$GITHUB_WORKSPACE/$DIFF"
-          echo "--- 改动后的关键行 ---"
           grep -n "initHttp" lib/application/application.dart | head -10
 
       - name: Setup Flutter
@@ -101,45 +100,57 @@ jobs:
           flutter-version: '3.47.9'
           channel: stable
           cache: true
-        env:
-          PUB_CACHE: ${{ runner.temp }}/pub-cache-stock
 
-      - name: Restore flutter_patcher environment
+      # 与宿主构建完全一致的原生改动：pub get 重生 xcconfig、Podfile/pbxproj 提到 16.0、
+      # 锁 AMapLocation、pod install。少了这步必报 PATCH_NATIVE_CHANGE。
+      - name: Replay native changes (same as host build)
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          rm -f ios/Flutter/Generated.xcconfig ios/Flutter/flutter_export_environment.sh
+          rm -f .flutter-plugins .flutter-plugins-dependencies
+          flutter pub get
+          python3 - <<'PY'
+          import re
+          p = "ios/Podfile"; s = open(p).read()
+          s = re.sub(r"platform :ios, '[\d.]+'", "platform :ios, '16.0'", s)
+          if "pod 'AMapLocation'" not in s:
+              s = s.replace("  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))",
+                            "  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))\n  pod 'AMapLocation', '2.11.0'\n  pod 'AMapFoundation', '1.8.2'")
+          open(p, "w").write(s)
+          p = "ios/Runner.xcodeproj/project.pbxproj"; s = open(p).read()
+          s = re.sub(r"IPHONEOS_DEPLOYMENT_TARGET = [\d.]+;", "IPHONEOS_DEPLOYMENT_TARGET = 16.0;", s)
+          open(p, "w").write(s)
+          PY
+          python3 "$GITHUB_WORKSPACE/.github/scripts/prepare_ios_signing.py" \
+            "${{ inputs.bundle_id }}" "${{ inputs.team_id }}" \
+            "${{ inputs.profile_name }}" "$PWD" "${{ inputs.version_code }}"
+          cd ios
+          for attempt in 1 2 3; do
+            if pod install --repo-update; then break; fi
+            rm -rf Pods Podfile.lock; sleep 10
+            [ "$attempt" -lt 3 ] || exit 1
+          done
+
+      - name: Restore flutter_patcher managed environment
         uses: actions/cache/restore@v4
         with:
           path: ~/.flutter_patcher
-          key: fp-env-${{ runner.os }}-3.47.9-v4
+          key: fp-env-${{ runner.os }}-3.47.9-v3
           restore-keys: |
             fp-env-${{ runner.os }}-3.47.9-
 
-      # 用 build 一次「预期失败」的 warm 拿到 managed SDK / pub-cache / tools 工件，
-      # 与宿主构建时同一套（Linux 上 build ios 到 xcodebuild 才会失败，前面足够）。
-      - name: Warm flutter_patcher environment
+      - name: Warm managed SDK
         working-directory: ${{ inputs.project_path }}
         run: |
           set -euo pipefail
-          rm -rf "$GITHUB_WORKSPACE/patcher-warm"
           dart run flutter_patcher build ios \
-            --application-id com.zerogis.zmoa --version-code "${{ inputs.version_code }}" \
-            --export-method ad-hoc --out "$GITHUB_WORKSPACE/patcher-warm" \
-            > "$RUNNER_TEMP/warm.log" 2>&1 || true
-          tail -30 "$RUNNER_TEMP/warm.log" || true
+            --application-id "${{ inputs.bundle_id }}" --version-code "${{ inputs.version_code }}" \
+            --export-method ad-hoc --out "$GITHUB_WORKSPACE/patcher-warm" > /dev/null 2>&1 || true
           rm -rf "$HOME"/.flutter_patcher/builds/run.pending-* "$GITHUB_WORKSPACE/patcher-warm"
           SDK_DIR=$(find "$HOME/.flutter_patcher/flutter" -maxdepth 1 -mindepth 1 -type d | head -1 || true)
-          if [ -z "$SDK_DIR" ] || [ ! -d "$SDK_DIR/packages/flutter" ]; then
-            echo "::error::managed SDK 未就绪（$HOME/.flutter_patcher/flutter）"
-            exit 1
-          fi
+          [ -d "$SDK_DIR/packages/flutter" ] || { echo "::error::managed SDK 未就绪"; exit 1; }
           echo "MANAGED_SDK=$SDK_DIR" >> "$GITHUB_ENV"
-          echo "managed SDK: $SDK_DIR"
-
-      - name: Resolve packages into patcher pub-cache
-        working-directory: ${{ inputs.project_path }}
-        run: |
-          set -euo pipefail
-          export PUB_CACHE="$HOME/.flutter_patcher/pub-cache"
-          mkdir -p "$PUB_CACHE"
-          flutter pub get
 
       - name: Normalize named constructors (same workaround as host build)
         working-directory: ${{ inputs.project_path }}
@@ -147,9 +158,7 @@ jobs:
           set -euo pipefail
           python3 "$GITHUB_WORKSPACE/.github/scripts/normalize_named_ctors.py" \
             --project "$PWD" --sdk "$MANAGED_SDK" \
-            --pub-cache "$HOME/.flutter_patcher/pub-cache" \
-            --report "$RUNNER_TEMP/ctors.json"
-          python3 -c "import json;d=json.load(open('$RUNNER_TEMP/ctors.json'));print(len(d['collisions']),'处冲突')"
+            --pub-cache "$HOME/.flutter_patcher/pub-cache" --report "$RUNNER_TEMP/ctors.json"
 
       - name: Restore baseline (local file store)
         env:
@@ -159,11 +168,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/baseline"
-          for attempt in 1 2 3; do
-            if gh release download ios-patcher-latest -R "$GITHUB_REPOSITORY" \
-                 -p "ios-baseline-$VERSION_CODE.tar.gz" -D "$RUNNER_TEMP/baseline" --clobber; then break; fi
-            echo "baseline 下载失败（$attempt/3），10s 后重试"; sleep 10
-          done
+          gh release download ios-patcher-latest -R "$GITHUB_REPOSITORY" \
+            -p "ios-baseline-$VERSION_CODE.tar.gz" -D "$RUNNER_TEMP/baseline" --clobber
           mkdir -p "$PROJECT/.flutter_patcher/baselines"
           tar -xzf "$RUNNER_TEMP/baseline/ios-baseline-$VERSION_CODE.tar.gz" \
             -C "$PROJECT/.flutter_patcher/baselines"
@@ -176,65 +182,56 @@ jobs:
           PATCH_ID: ${{ inputs.patch_id }}
         run: |
           set -euo pipefail
-          OUT="$GITHUB_WORKSPACE/patch-out/$PATCH_ID"
-          rm -rf "$OUT"; mkdir -p "$OUT"
+          OUT="$GITHUB_WORKSPACE/patch-out/$PATCH_ID"      # 必须不存在
+          mkdir -p "$(dirname "$OUT")"
           cd "$PROJECT"
           set +e
-          dart run flutter_patcher patch ios \
-            --version-code "$VERSION_CODE" \
-            --out "$OUT" \
+          dart run flutter_patcher patch ios --version-code "$VERSION_CODE" --out "$OUT" \
             2> "$RUNNER_TEMP/patch.err" | tee "$RUNNER_TEMP/patch.json"
           code=${PIPESTATUS[0]}
           set -e
           if [ -s "$RUNNER_TEMP/patch.err" ]; then
-            echo "----- patch stderr 全量 -----"
-            fold -w 300 "$RUNNER_TEMP/patch.err" || true
+            echo "--- stderr ---"; fold -w 300 "$RUNNER_TEMP/patch.err"
           fi
           if [ "$code" -ne 0 ]; then
-            echo "::error::flutter_patcher patch 失败 (exit=$code)"
-            for d in "$HOME"/.flutter_patcher/builds/*; do
+            for d in "$HOME"/.flutter_patcher/patches/run.pending-*; do
               [ -d "$d" ] || continue
-              echo "== $d =="
-              find "$d" -maxdepth 2 -type f | head -40
-              for f in "$d"/*.log "$d"/failure.json; do
-                [ -f "$f" ] || continue
-                echo "--- ${f##*/} ---"
-                tail -150 "$f"
-              done
+              echo "== $d =="; find "$d" -maxdepth 2 -type f | head -40
+              [ -f "$d/failure.json" ] && tail -120 "$d/failure.json"
             done
             exit "$code"
           fi
-          echo "=== patch.json ==="
-          cat "$RUNNER_TEMP/patch.json"
-          echo "=== 产物 ==="
           find "$OUT" -maxdepth 2 -type f -exec ls -lh {} \;
           F=$(find "$OUT" -name '*.fptc' | head -1)
           [ -n "$F" ] || { echo "::error::未产出 .fptc"; exit 1; }
-          cp "$F" "$GITHUB_WORKSPACE/patch-out/patch.fptc"
-          sha256sum "$GITHUB_WORKSPACE/patch-out/patch.fptc"
-          echo "FPTC=$GITHUB_WORKSPACE/patch-out/patch.fptc" >> "$GITHUB_ENV"
+          cp "$F" "$GITHUB_WORKSPACE/patch.fptc"
+          shasum -a 256 "$GITHUB_WORKSPACE/patch.fptc"
+          echo "FPTC=$GITHUB_WORKSPACE/patch.fptc" >> "$GITHUB_ENV"
 
-      - name: Upload patch artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ios-patch-${{ inputs.patch_id }}
-          path: |
-            patch-out/patch.fptc
-            patch-out/${{ inputs.patch_id }}
+          path: patch.fptc
           if-no-files-found: error
 
       - name: Attach patch to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_CODE: ${{ inputs.version_code }}
           PATCH_ID: ${{ inputs.patch_id }}
         run: |
           set -euo pipefail
           TAG=ios-patches
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
-              --title "iOS patches" --notes "flutter_patcher iOS 增量补丁（.fptc）"
-          cp "$FPTC" "$RUNNER_TEMP/11-ios-arm64.fptc"
-          gh release upload "$TAG" "$RUNNER_TEMP/11-ios-arm64.fptc" -R "$GITHUB_REPOSITORY" --clobber
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "iOS patches" --notes "iOS 增量补丁"
+          cp "$FPTC" "$RUNNER_TEMP/$VERSION_CODE-ios-arm64.fptc"
+          gh release upload "$TAG" "$RUNNER_TEMP/$VERSION_CODE-ios-arm64.fptc" -R "$GITHUB_REPOSITORY" --clobber
           cp "$FPTC" "$RUNNER_TEMP/$PATCH_ID.fptc"
           gh release upload "$TAG" "$RUNNER_TEMP/$PATCH_ID.fptc" -R "$GITHUB_REPOSITORY" --clobber
-          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+
+      - name: Save flutter_patcher managed environment
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.flutter_patcher
+          key: fp-env-${{ runner.os }}-3.47.9-v3
