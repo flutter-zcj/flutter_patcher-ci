@@ -1,0 +1,26 @@
+diff --git a/lib/application/application.dart b/lib/application/application.dart
+--- a/lib/application/application.dart
++++ b/lib/application/application.dart
+@@ -37,8 +37,8 @@
+     //   initHttp();
+     // }
+ 
+-    // initHttp();
+-    initHttpTest();
++    initHttp();
++    // initHttpTest();
+     // initHttpDev();
+ 
+ 
+diff --git a/lib/pages/main/main_page.dart b/lib/pages/main/main_page.dart
+--- a/lib/pages/main/main_page.dart
++++ b/lib/pages/main/main_page.dart
+@@ -43,7 +43,7 @@
+   @override
+   PreferredSizeWidget? appBar(BuildContext context) => AppBar(
+     title: Text(
+-      '欢迎${UserManager.user.name}4454454554',
++      '欢迎${UserManager.user.name}88888888999988898',
+       style: const TextStyle(color: Colors.white),
+     ),
+     leading: const SizedBox(
