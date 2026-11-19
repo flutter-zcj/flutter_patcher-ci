@@ -1,14 +1,8 @@
 diff --git a/lib/manager/patch_manager.dart b/lib/manager/patch_manager.dart
-index 6943bb3..d5bb639 100644
+index 6943bb3..6a111b6 100644
 --- a/lib/manager/patch_manager.dart
 +++ b/lib/manager/patch_manager.dart
-@@ -1,4 +1,5 @@
- import 'dart:io';
-+import 'dart:ui' as ui;
- 
- import 'package:flutter/foundation.dart';
- import 'package:flutter_patcher/flutter_patcher.dart';
-@@ -83,15 +84,78 @@ class PatchManager
+@@ -83,17 +83,69 @@ class PatchManager
      }
      try
      {
@@ -45,25 +39,14 @@ index 6943bb3..d5bb639 100644
 +  {
 +    try
 +    {
-+      // 包在补丁框架钩子的外层：先过滤，其余错误原样交回补丁框架统计。
-+      // 只用 dart:ui 的 PlatformDispatcher，避免把 widgets/material 拉进补丁模块。
-+      final priorPlatform = ui.PlatformDispatcher.instance.onError;
-+      ui.PlatformDispatcher.instance.onError =
-+          (Object error, StackTrace stack)
++      // 只接管 FlutterError.onError：EventChannel 的原生通道缺失走的是
++      // FlutterError.reportError，正是补丁框架判定启动失败的上报路径。
++      // 不额外引用 dart:ui / widgets，避免把补丁退化成全量模块触发字体校验。
++      final priorFlutter = FlutterError.onError;
++      FlutterError.onError = (FlutterErrorDetails details)
        {
 -        debugPrint('[PatchManager] init failed: $e');
 -      }
-+        if (_isTolerableBootError(error))
-+        {
-+          debugPrint('[PatchManager] tolerated boot error: $error');
-+          return true;
-+        }
-+        return priorPlatform?.call(error, stack) ?? false;
-+      };
-+
-+      final priorFlutter = FlutterError.onError;
-+      FlutterError.onError = (FlutterErrorDetails details)
-+      {
 +        if (_isTolerableBootError(details.exception))
 +        {
 +          debugPrint('[PatchManager] tolerated boot error: '
@@ -72,14 +55,14 @@ index 6943bb3..d5bb639 100644
 +        }
 +        priorFlutter?.call(details);
 +      };
-     }
++    }
 +    catch (e)
 +    {
 +      // 过滤器装不上不影响补丁正常流程，只记录。
 +      debugPrint('[PatchManager] install error filter failed: $e');
-+    }
-+  }
-+
+     }
+   }
+ 
 +  /// 插件缺失一类的错误，业务已经自行兜底，不应影响补丁启动判定
 +  ///
 +  /// 只做字符串匹配，避免在热更新动态模块里引用新的类类型。
@@ -88,10 +71,12 @@ index 6943bb3..d5bb639 100644
 +    final String text = error.toString();
 +    return text.contains('MissingPluginException') ||
 +        text.contains('No implementation found for method');
-   }
- 
++  }
++
    /// 检查并安装补丁
-@@ -177,10 +241,14 @@ class PatchManager
+   ///
+   /// 后台静默下载安装，不显示进度、不弹确认框；
+@@ -177,10 +229,14 @@ class PatchManager
            await _recoverBlacklisted();
            return;
          }
@@ -107,7 +92,7 @@ index 6943bb3..d5bb639 100644
        CxToastUtil.show(_tipInstalled);
      }
      catch (e)
-@@ -268,7 +336,9 @@ class PatchManager
+@@ -268,7 +324,9 @@ class PatchManager
      switch (error)
      {
        case PatchApplyError.invalidArgs:
@@ -118,7 +103,7 @@ index 6943bb3..d5bb639 100644
        case PatchApplyError.blacklisted:
          return '该补丁已被标记为异常，已阻止安装';
        case PatchApplyError.network:
-@@ -317,6 +387,35 @@ class PatchManager
+@@ -317,6 +375,35 @@ class PatchManager
      }
    }
  
@@ -154,7 +139,7 @@ index 6943bb3..d5bb639 100644
    /// 补丁被拉黑后的恢复流程
    ///
    /// 先打印黑名单明细方便定位，再清空本地记录，让用户能重新检查更新。
-@@ -324,14 +423,26 @@ class PatchManager
+@@ -324,14 +411,26 @@ class PatchManager
    static Future<void> _recoverBlacklisted() async
    {
      final List<BlacklistEntry> entries = await loadBlacklist();
