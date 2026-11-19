@@ -1,25 +1,99 @@
+diff --git a/lib/manager/patch_manager.dart b/lib/manager/patch_manager.dart
+index 6943bb3..a53c27c 100644
 --- a/lib/manager/patch_manager.dart
 +++ b/lib/manager/patch_manager.dart
-@@ -84,13 +84,14 @@
+@@ -1,6 +1,7 @@
+ import 'dart:io';
+ 
+ import 'package:flutter/foundation.dart';
++import 'package:flutter/widgets.dart';
+ import 'package:flutter_patcher/flutter_patcher.dart';
+ import 'package:zpub_core/zpub_core.dart';
+ 
+@@ -83,15 +84,78 @@ class PatchManager
+     }
      try
      {
-       await FlutterPatcher.init(maxCrashCount: _maxCrashCount);
+-      await FlutterPatcher.init(maxCrashCount: _maxCrashCount);
++      // verifyAfter 归零：首帧一到立刻关闭补丁框架的“启动期错误”观察窗，
++      // 避免启动后业务抛出的异步异常被误判成补丁启动失败。
++      await FlutterPatcher.init(
++        maxCrashCount: _maxCrashCount,
++        verifyAfter: Duration.zero,
++      );
++
++      // 补丁框架安装完钩子之后再包一层，优先挡掉与补丁无关的插件缺失错误。
++      _installErrorFilter();
 +      debugPrint('[PatchManager] init maxCrashCount=$_maxCrashCount');
      }
      catch (e)
      {
 -      if (kDebugMode)
--      {
--        debugPrint('[PatchManager] init failed: $e');
--      }
 +      // 容错次数写不进原生配置时，原生按默认值 1 记账，
 +      // 补丁启动失败一次就会被拉黑，这里必须留痕而不是静默。
 +      lastError = '热更新初始化失败：$e';
 +      debugPrint('[PatchManager] init failed: $e');
++    }
++  }
++
++  /// 把「业务已经自行兜住、与补丁无关」的插件缺失错误挡在补丁判定之外
++  ///
++  /// flutter_patcher 会把启动阶段的任意未捕获错误当成补丁启动失败并立即拉黑，
++  /// 而 EventChannel.receiveBroadcastStream() 在原生通道不存在时走的是
++  /// FlutterError.reportError，绕过了业务代码里的 try/catch。
++  /// iOS 上 zpub_location 的 GNSS 通道（zpub_location/gnssEventCancel）没有原生实现，
++  /// 业务侧已用 try/catch + 超时兜底，但仍会把整份补丁误判成坏补丁，这里只过滤这一类。
++  static void _installErrorFilter()
++  {
++    try
++    {
++      // 包在补丁框架钩子的外层：先过滤，其余错误原样交回补丁框架统计。
++      final priorPlatform =
++          WidgetsBinding.instance.platformDispatcher.onError;
++      WidgetsBinding.instance.platformDispatcher.onError =
++          (Object error, StackTrace stack)
+       {
+-        debugPrint('[PatchManager] init failed: $e');
+-      }
++        if (_isTolerableBootError(error))
++        {
++          debugPrint('[PatchManager] tolerated boot error: $error');
++          return true;
++        }
++        return priorPlatform?.call(error, stack) ?? false;
++      };
++
++      final priorFlutter = FlutterError.onError;
++      FlutterError.onError = (FlutterErrorDetails details)
++      {
++        if (_isTolerableBootError(details.exception))
++        {
++          debugPrint('[PatchManager] tolerated boot error: '
++              '${details.exception}');
++          return;
++        }
++        priorFlutter?.call(details);
++      };
      }
++    catch (e)
++    {
++      // 过滤器装不上不影响补丁正常流程，只记录。
++      debugPrint('[PatchManager] install error filter failed: $e');
++    }
++  }
++
++  /// 插件缺失一类的错误，业务已经自行兜底，不应影响补丁启动判定
++  ///
++  /// 只做字符串匹配，避免在热更新动态模块里引用新的类类型。
++  static bool _isTolerableBootError(Object error)
++  {
++    final String text = error.toString();
++    return text.contains('MissingPluginException') ||
++        text.contains('No implementation found for method');
    }
  
-@@ -177,10 +178,14 @@
+   /// 检查并安装补丁
+@@ -177,10 +241,14 @@ class PatchManager
            await _recoverBlacklisted();
            return;
          }
@@ -35,7 +109,7 @@
        CxToastUtil.show(_tipInstalled);
      }
      catch (e)
-@@ -268,7 +273,9 @@
+@@ -268,7 +336,9 @@ class PatchManager
      switch (error)
      {
        case PatchApplyError.invalidArgs:
@@ -46,13 +120,10 @@
        case PatchApplyError.blacklisted:
          return '该补丁已被标记为异常，已阻止安装';
        case PatchApplyError.network:
-@@ -314,7 +321,36 @@
-     catch (e)
-     {
-       debugPrint('[PatchManager] clearBlacklist failed: $e');
-+    }
-+  }
-+
+@@ -317,6 +387,35 @@ class PatchManager
+     }
+   }
+ 
 +  /// 打印本机热更新现状，真机排查看这一段日志即可定位
 +  ///
 +  /// 只用宿主已经导出到补丁接口的能力：本机补丁文件名、当前已安装的补丁
@@ -63,7 +134,7 @@
 +    if (!PatchConfig.enabled)
 +    {
 +      return;
-     }
++    }
 +
 +    try
 +    {
@@ -80,10 +151,12 @@
 +
 +    final List<BlacklistEntry> entries = await loadBlacklist();
 +    debugPrint('[PatchManager] blacklist=${entries.length} $entries');
-   }
- 
++  }
++
    /// 补丁被拉黑后的恢复流程
-@@ -324,14 +360,26 @@
+   ///
+   /// 先打印黑名单明细方便定位，再清空本地记录，让用户能重新检查更新。
+@@ -324,14 +423,26 @@ class PatchManager
    static Future<void> _recoverBlacklisted() async
    {
      final List<BlacklistEntry> entries = await loadBlacklist();
