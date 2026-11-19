@@ -1,0 +1,207 @@
+--- a/lib/manager/patch_manager.dart
++++ b/lib/manager/patch_manager.dart
+@@ -69,6 +69,12 @@
+   /// 调到 3 留出重试余地；真正的坏补丁也会在第 3 次被拦下。
+   static const int _maxCrashCount = 3;
+ 
++  /// 补丁文件头长度（FPTC v1：magic/版本/宿主指纹/序号/长度/摘要/签名）
++  ///
++  /// 只取前 146 字节就能判断这份补丁属于哪个宿主、序号是否前进，
++  /// 不用等整包安装后再被"补丁与当前版本不匹配"这种笼统提示误导。
++  static const int _patchHeaderSize = 146;
++
+   /// 初始化热更新，必须在 runApp 之前调用
+   ///
+   /// main 里通过 [runCxApp] 的 beforeAppRunning 回调注入，此时
+@@ -84,13 +90,14 @@
+     try
+     {
+       await FlutterPatcher.init(maxCrashCount: _maxCrashCount);
++      debugPrint('[PatchManager] init maxCrashCount=$_maxCrashCount');
+     }
+     catch (e)
+     {
+-      if (kDebugMode)
+-      {
+-        debugPrint('[PatchManager] init failed: $e');
+-      }
++      // 容错次数写不进原生配置时，原生按默认值 1 记账，
++      // 补丁启动失败一次就会被拉黑，这里必须留痕而不是静默。
++      lastError = '热更新初始化失败：$e';
++      debugPrint('[PatchManager] init failed: $e');
+     }
+   }
+ 
+@@ -169,6 +176,17 @@
+         return;
+       }
+ 
++      // 下载完先看文件头：宿主指纹不符或序号没前进时直接给出真实原因，
++      // 不再等安装阶段返回 invalidArgs，把"序号没前进"误读成"版本不匹配"
++      final String? precheck = await _precheck(bytes);
++      if (precheck != null)
++      {
++        lastError = precheck;
++        CxToastUtil.error(precheck);
++        await logDiagnostics();
++        return;
++      }
++
+       final PatchApplyResult result = await FlutterPatcher.applyPatchBytes(bytes);
+       if (!result.ok)
+       {
+@@ -177,10 +195,14 @@
+           await _recoverBlacklisted();
+           return;
+         }
+-        CxToastUtil.error('补丁安装失败：${_errorText(result.error)}');
++        lastError = _errorText(result.error);
++        CxToastUtil.error('补丁安装失败：$lastError');
++        await logDiagnostics();
+         return;
+       }
+ 
++      final String? installed = await _installedSeq();
++      debugPrint('[PatchManager] installed seq=$installed');
+       CxToastUtil.show(_tipInstalled);
+     }
+     catch (e)
+@@ -229,6 +251,46 @@
+     finally
+     {
+       client?.close(force: true);
++    }
++  }
++
++  /// 用补丁文件头预检这份补丁对本机是否有效，有效返回 null
++  ///
++  /// 原生只拿前 146 字节判断：宿主指纹不符、序号没有超过本机已接受的水位
++  /// 都会被判为"不新鲜"。这两种情况装上去也不会成功，提前拦下能把
++  /// invalidArgs 还原成具体原因，并省掉一次整包安装。
++  static Future<String?> _precheck(List<int> bytes) async
++  {
++    try
++    {
++      final int head = bytes.length < _patchHeaderSize
++          ? bytes.length
++          : _patchHeaderSize;
++      final PatchInspection inspection =
++          await FlutterPatcher.inspectPatch(bytes.sublist(0, head));
++      if (inspection.fresh)
++      {
++        return null;
++      }
++
++      final String reason = inspection.reason ?? '未知原因';
++      if (reason.contains('another host'))
++      {
++        return '这份补丁不属于当前宿主，需要按本机宿主重新出补丁';
++      }
++      if (reason.contains('newer'))
++      {
++        final int acceptedSeq = await _acceptedSeq();
++        return '补丁序号 ${inspection.seq ?? 0} 没有超过本机已接受的 '
++            '$acceptedSeq，需要重新出序号更大的补丁';
++      }
++      return '补丁文件头无效：$reason';
++    }
++    catch (e)
++    {
++      // 预检失败不阻断安装，交给原生做完整的验签与长度校验
++      debugPrint('[PatchManager] precheck failed: $e');
++      return null;
+     }
+   }
+ 
+@@ -268,7 +330,9 @@
+     switch (error)
+     {
+       case PatchApplyError.invalidArgs:
+-        return '补丁与当前版本不匹配';
++        // iOS/Android 原生只在"序号没超过已接受水位"或"撤回序号不前进"时返回它，
++        // 与 ABI、versionCode、签名无关，文案不能再说成版本不匹配
++        return '补丁序号未超过本机已接受的版本，需要下发序号更大的补丁';
+       case PatchApplyError.blacklisted:
+         return '该补丁已被标记为异常，已阻止安装';
+       case PatchApplyError.network:
+@@ -317,6 +381,45 @@
+     }
+   }
+ 
++  /// 打印本机热更新现状，真机排查看这一段日志即可定位
++  ///
++  /// 包含宿主补丁文件名、宿主指纹、本机已接受的补丁序号、上一次冷启动的
++  /// 补丁决策和本机黑名单。补丁失败或回退之后调用，用来区分
++  /// "补丁没装进去"和"装进去了但启动失败被拉黑"。
++  static Future<void> logDiagnostics() async
++  {
++    if (!PatchConfig.enabled)
++    {
++      return;
++    }
++
++    try
++    {
++      final PatchTarget target = await FlutterPatcher.patchTarget;
++      debugPrint('[PatchManager] target file=${target.fileName} '
++          'fingerprint=${target.fingerprint} '
++          'acceptedSeq=${target.acceptedSeq} signed=${target.signed}');
++    }
++    catch (e)
++    {
++      debugPrint('[PatchManager] patchTarget failed: $e');
++    }
++
++    try
++    {
++      final PatchBootDiagnostic? diagnostic =
++          await FlutterPatcher.lastBootDiagnostic;
++      debugPrint('[PatchManager] lastBoot=$diagnostic');
++    }
++    catch (e)
++    {
++      debugPrint('[PatchManager] lastBootDiagnostic failed: $e');
++    }
++
++    final List<BlacklistEntry> entries = await loadBlacklist();
++    debugPrint('[PatchManager] blacklist=${entries.length} $entries');
++  }
++
+   /// 补丁被拉黑后的恢复流程
+   ///
+   /// 先打印黑名单明细方便定位，再清空本地记录，让用户能重新检查更新。
+@@ -330,10 +433,33 @@
+           'reason=${entry.reason} at=${entry.blacklistedAt}');
+     }
+     await clearBlacklist();
++
++    // 清掉的只是拉黑记账，序号水位 high 不会回退：
++    // 同一个序号的补丁再装一次，仍然会被判为"不新鲜"而返回 invalidArgs
++    final int acceptedSeq = await _acceptedSeq();
+     CxToastUtil.show(
+-        '该补丁曾被拉黑（${entries.length} 条），已清除记录，请重新检查更新');
++        '已清除拉黑记录（${entries.length} 条）；本机已接受序号 $acceptedSeq，'
++        '需下发序号更大的补丁');
+   }
+ 
++  /// 本机已接受的补丁序号水位，取不到按 0 处理
++  ///
++  /// 原生安装成功就会抬高它，拉黑、清黑名单都不会让它回退；
++  /// 后续补丁只有序号大于它才会被接受，这正是 invalidArgs 的根因。
++  static Future<int> _acceptedSeq() async
++  {
++    try
++    {
++      final PatchTarget target = await FlutterPatcher.patchTarget;
++      return target.acceptedSeq;
++    }
++    catch (e)
++    {
++      debugPrint('[PatchManager] acceptedSeq failed: $e');
++      return 0;
++    }
++  }
++
+   /// 当前已安装补丁的序号，取不到按 0 处理
+   static Future<String?> _installedSeq() async
+   {
