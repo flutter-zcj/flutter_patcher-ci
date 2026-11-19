@@ -1,0 +1,12 @@
+diff --git a/lib/pages/main/main_page.dart b/lib/pages/main/main_page.dart
+--- a/lib/pages/main/main_page.dart
++++ b/lib/pages/main/main_page.dart
+@@ -43,7 +43,7 @@
+   @override
+   PreferredSizeWidget? appBar(BuildContext context) => AppBar(
+     title: Text(
+-      '欢迎${UserManager.user.name}呀呀呀呀呀呀',
++      '欢迎${UserManager.user.name}8787878754545454212121请我去玩',
+       style: const TextStyle(color: Colors.white),
+     ),
+     leading: const SizedBox(
