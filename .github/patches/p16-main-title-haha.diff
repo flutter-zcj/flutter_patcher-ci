@@ -1,0 +1,13 @@
+diff --git a/lib/pages/main/main_page.dart b/lib/pages/main/main_page.dart
+index 237d372..b9d3bff 100644
+--- a/lib/pages/main/main_page.dart
++++ b/lib/pages/main/main_page.dart
+@@ -43,7 +43,7 @@ class MainPage extends BasePluginView<MainController>
+   @override
+   PreferredSizeWidget? appBar(BuildContext context) => AppBar(
+     title: Text(
+-      '欢迎${UserManager.user.name}',
++      '欢迎${UserManager.user.name}哈哈',
+       style: const TextStyle(color: Colors.white),
+     ),
+     leading: const SizedBox(
